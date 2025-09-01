@@ -1,0 +1,4 @@
+# Install Seamless Communication from Git to decouple your code
+seamless-communication @ git+https://github.com/facebookresearch/seamless_communication.git@90e2b57ac4d82fa2bfaa25caeffe39ceb8b2ebec
+transformers>=4.40
+peft>=0.10
