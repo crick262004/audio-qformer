@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import random
 import json
 import logging
 import os
@@ -426,6 +427,8 @@ def evaluate_dataset(
     amp_enabled: bool,
     batch_size: int,
     gen_max_new_tokens: int,
+    gen_limit: int,
+    gen_seed: int,
     save_predictions_path: Optional[Path] = None,
     num_preview: int = 3,
 ) -> Tuple[float, List[Dict[str, str]]]:
@@ -439,6 +442,17 @@ def evaluate_dataset(
     total_count = 0
     previews: List[Dict[str, str]] = []
 
+    # Prepare sampling for generation
+    ds_len = len(ds)
+    limit = max(0, min(int(gen_limit), ds_len))
+    if limit > 0:
+        rng = random.Random(int(gen_seed))
+        selected_indices = set(rng.sample(range(ds_len), limit))
+        logger.info(f"{split_name}: generation sampling {limit}/{ds_len} (seed={gen_seed}), indices={sorted(list(selected_indices))}")
+    else:
+        selected_indices = set()
+        logger.info(f"{split_name}: generation sampling disabled (gen_limit={gen_limit})")
+
     if save_predictions_path is not None:
         save_predictions_path.parent.mkdir(parents=True, exist_ok=True)
         save_predictions_path.write_text("")
@@ -446,6 +460,7 @@ def evaluate_dataset(
     llama_was_training = any(p.requires_grad and p.grad is not None for p in llama.parameters()) or llama.training
     llama.eval()
 
+    global_offset = 0
     for seqs, padding_mask, targets, insts, audio_paths in tqdm(loader, desc=f"Evaluating {split_name}"):
         seqs = seqs.to(device=device, dtype=dtype)
         if padding_mask is not None and hasattr(padding_mask, "to"):
@@ -478,42 +493,58 @@ def evaluate_dataset(
         total_loss += float(lm_loss) * bs
         total_count += bs
 
-        gen_inputs, _, gen_attn, lengths = _build_eval_batch(
-            tokenizer,
-            emb_layer,
-            sep_emb_static,
-            audio_embeds,
-            insts,
-            None,
-            None,
-            emb_layer.weight.device,
-        )
-        gen_out = llama.generate(
-            inputs_embeds=gen_inputs,
-            attention_mask=gen_attn,
-            max_new_tokens=gen_max_new_tokens,
-            do_sample=False,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            use_cache=True,
-        )
-        gen_tokens_only = gen_out[:, gen_inputs.size(1):]
-        preds = tokenizer.batch_decode(gen_tokens_only, skip_special_tokens=True)
+        # Run generation only for sampled dataset indices
+        local_selected = [i for i in range(bs) if (global_offset + i) in selected_indices]
+        if local_selected:
+            gen_inputs, _, gen_attn, _ = _build_eval_batch(
+                tokenizer,
+                emb_layer,
+                sep_emb_static,
+                audio_embeds,
+                insts,
+                None,
+                None,
+                emb_layer.weight.device,
+            )
 
-        for i in range(min(num_preview - len(previews), bs)):
-            previews.append({
-                "audio": audio_paths[i],
-                "pred": preds[i].strip(),
-                "ref": targets[i],
-            })
-            if len(previews) >= num_preview:
-                break
+            index_tensor = torch.tensor(local_selected, device=gen_inputs.device, dtype=torch.long)
+            gen_inputs_sel = gen_inputs.index_select(0, index_tensor)
+            gen_attn_sel = gen_attn.index_select(0, index_tensor)
 
-        if save_predictions_path is not None:
-            with save_predictions_path.open("a", encoding="utf-8") as f:
-                for a, p, r in zip(audio_paths, preds, targets):
-                    rec = {"audio": a, "prediction": p.strip(), "reference": r}
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            gen_out = llama.generate(
+                inputs_embeds=gen_inputs_sel,
+                attention_mask=gen_attn_sel,
+                max_new_tokens=gen_max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+            gen_tokens_only = gen_out[:, gen_inputs_sel.size(1):]
+            preds_sel = tokenizer.batch_decode(gen_tokens_only, skip_special_tokens=True)
+
+            # Add previews from sampled items only
+            for idx_in_batch, pred_text in zip(local_selected, preds_sel):
+                if len(previews) >= num_preview:
+                    break
+                previews.append({
+                    "audio": audio_paths[idx_in_batch],
+                    "pred": pred_text.strip(),
+                    "ref": targets[idx_in_batch],
+                })
+
+            # Persist predictions if requested
+            if save_predictions_path is not None:
+                with save_predictions_path.open("a", encoding="utf-8") as f:
+                    for idx_in_batch, pred_text in zip(local_selected, preds_sel):
+                        rec = {
+                            "audio": audio_paths[idx_in_batch],
+                            "prediction": pred_text.strip(),
+                            "reference": targets[idx_in_batch],
+                        }
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        global_offset += bs
 
     avg_loss = total_loss / max(1, total_count)
     logger.info(f"{split_name} avg_lm_loss={avg_loss:.4f}")
@@ -574,7 +605,7 @@ def train(args: argparse.Namespace) -> None:
     llm_repo_id = _resolve_llm_repo_id(args.llm_model_name)
 
     hf_token = (
-        (args.hf_token if getattr(args, "hf_token", None) else None)
+        args.hf_token
         or os.getenv("HF_TOKEN")
         or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     )
@@ -623,9 +654,9 @@ def train(args: argparse.Namespace) -> None:
     llm_emb_dim = emb_layer.embedding_dim
     projector = SimpleProjector(in_dim=model_dim, out_dim=llm_emb_dim).to(device=device, dtype=train_dtype)
 
-    align = AlignHeads(d_q=model_dim, d_t=llm_emb_dim, d_con=getattr(args, "contrastive_dim", 768)).to(device=device, dtype=train_dtype)
-    text_queue = ContrastiveQueue(d_con=getattr(args, "contrastive_dim", 768), K=getattr(args, "queue_size", 32768), device=str(device))
-    audio_queue = ContrastiveQueue(d_con=getattr(args, "contrastive_dim", 768), K=getattr(args, "queue_size", 32768), device=str(device))
+    align = AlignHeads(d_q=model_dim, d_t=llm_emb_dim, d_con=args.contrastive_dim).to(device=device, dtype=train_dtype)
+    text_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
+    audio_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
 
     params = list(qformer.parameters()) + list(projector.parameters()) + list(align.parameters())
     if any(p.requires_grad for p in llama.parameters()):
@@ -664,11 +695,20 @@ def train(args: argparse.Namespace) -> None:
 
     topk_mgr = TopKCheckpointManager(Path(args.output_dir) / "best", k=args.save_top_k)
     best_dev = float("inf")
+    no_improve_epochs = 0
 
     for epoch in range(args.epochs):
         epoch_loader = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        # Track per-epoch progress for half-epoch dev eval
+        batches_in_epoch = 0
+        total_batches_this_epoch = len(loader)
+        half_point = max(1, total_batches_this_epoch // 2)
+        half_epoch_done = False
+        improved_this_epoch = False
+
         for seqs, padding_mask, targets, insts, _audio_paths in epoch_loader:
             step += 1
+            batches_in_epoch += 1
             seqs = seqs.to(device=device, dtype=dtype)
             if padding_mask is not None and hasattr(padding_mask, "to"):
                 padding_mask = padding_mask.to(device)
@@ -788,7 +828,8 @@ def train(args: argparse.Namespace) -> None:
                     'match': f"{float(L_match):.4f}"
                 })
 
-            if (step > 0 and step % args.dev_eval_steps == 0 and 
+            # Step-based dev eval (only if > 0)
+            if (args.dev_eval_steps > 0 and step > 0 and step % args.dev_eval_steps == 0 and 
                 args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl)):
                 eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
                 dev_loss, previews = evaluate_dataset(
@@ -807,10 +848,14 @@ def train(args: argparse.Namespace) -> None:
                     amp_enabled=amp_enabled,
                     batch_size=eval_bs,
                     gen_max_new_tokens=args.gen_max_new_tokens,
+                    gen_limit=args.gen_limit_dev,
+                    gen_seed=args.gen_seed,
                     save_predictions_path=None,
                     num_preview=args.eval_preview_samples,
                 )
-                best_dev = min(best_dev, dev_loss)
+                if dev_loss < best_dev:
+                    improved_this_epoch = True
+                    best_dev = dev_loss
                 for j, ex in enumerate(previews):
                     logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
                 state = {
@@ -822,6 +867,48 @@ def train(args: argparse.Namespace) -> None:
                 saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
                 if saved_dir is not None:
                     logger.info(f"Saved top-k checkpoint to {saved_dir}")
+
+            # Half-epoch dev eval (default when --dev_eval_steps == -1)
+            if (args.dev_eval_steps == -1 and not half_epoch_done and
+                args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl) and
+                batches_in_epoch >= half_point):
+                eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
+                dev_loss, previews = evaluate_dataset(
+                    split_name="dev",
+                    dataset_jsonl=args.dev_jsonl,
+                    translator=translator,
+                    tokenizer=tokenizer,
+                    emb_layer=emb_layer,
+                    sep_emb_static=sep_emb_static,
+                    qformer=qformer,
+                    projector=projector,
+                    llama=llama,
+                    device=device,
+                    dtype=dtype,
+                    train_dtype=train_dtype,
+                    amp_enabled=amp_enabled,
+                    batch_size=eval_bs,
+                    gen_max_new_tokens=args.gen_max_new_tokens,
+                    gen_limit=args.gen_limit_dev,
+                    gen_seed=args.gen_seed,
+                    save_predictions_path=None,
+                    num_preview=args.eval_preview_samples,
+                )
+                if dev_loss < best_dev:
+                    improved_this_epoch = True
+                    best_dev = dev_loss
+                for j, ex in enumerate(previews):
+                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                state = {
+                    "qformer": qformer.state_dict(),
+                    "projector": projector.state_dict(),
+                    "align": align.state_dict(),
+                }
+                tag = f"epoch{epoch}_step{step}_half"
+                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                if saved_dir is not None:
+                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                half_epoch_done = True
 
             if args.max_steps > 0 and step >= args.max_steps:
                 break
@@ -848,10 +935,14 @@ def train(args: argparse.Namespace) -> None:
                 amp_enabled=amp_enabled,
                 batch_size=eval_bs,
                 gen_max_new_tokens=args.gen_max_new_tokens,
+                gen_limit=args.gen_limit_dev,
+                gen_seed=args.gen_seed,
                 save_predictions_path=None,
                 num_preview=args.eval_preview_samples,
             )
-            best_dev = min(best_dev, dev_loss)
+            if dev_loss < best_dev:
+                improved_this_epoch = True
+                best_dev = dev_loss
             for j, ex in enumerate(previews):
                 logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
             state = {
@@ -864,6 +955,19 @@ def train(args: argparse.Namespace) -> None:
             if saved_dir is not None:
                 logger.info(f"Saved top-k checkpoint to {saved_dir}")
 
+        # Early stopping check (based on dev improvements within the epoch)
+        if args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl):
+            if improved_this_epoch:
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+                logger.info(
+                    f"No dev improvement in epoch {epoch+1}. Patience {no_improve_epochs}/{args.early_stop_patience}"
+                )
+            if no_improve_epochs >= args.early_stop_patience:
+                logger.info("Early stopping triggered due to no dev improvement.")
+                break
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(qformer.state_dict(), out_dir / "qformer.pt")
@@ -871,7 +975,7 @@ def train(args: argparse.Namespace) -> None:
     torch.save(align.state_dict(), out_dir / "align_heads.pt")
     logger.info(f"Saved Q-Former, projector, and align heads to {out_dir}")
 
-    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not getattr(args, 'skip_final_test_eval', False):
+    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not args.skip_final_test_eval:
         eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
         test_pred_path = out_dir / "test_predictions.jsonl"
         test_loss, previews = evaluate_dataset(
@@ -890,6 +994,8 @@ def train(args: argparse.Namespace) -> None:
             amp_enabled=amp_enabled,
             batch_size=eval_bs,
             gen_max_new_tokens=args.gen_max_new_tokens,
+            gen_limit=args.gen_limit_test,
+            gen_seed=args.gen_seed,
             save_predictions_path=test_pred_path,
             num_preview=args.eval_preview_samples,
         )
@@ -915,7 +1021,7 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--llm_lora", type=str, default=None, help="Optional LoRA adapter path for Llama")
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
@@ -924,7 +1030,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--use_fp16", action="store_true", help="Use mixed precision training")
     p.add_argument("--no_fp16", action="store_true", help="Disable mixed precision (fp16 enabled by default)")
-    p.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
+    p.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
     p.add_argument("--qformer_layers", type=int, default=2)
     p.add_argument("--qformer_heads", type=int, default=8)
     p.add_argument("--qformer_queries", type=int, default=16)
@@ -933,6 +1039,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--test_jsonl", type=str, default=f"{DATA_DIR}/test.jsonl")
     p.add_argument("--eval_batch_size", type=int, default=1, help="Eval batch size (defaults to train batch size)")
     p.add_argument("--gen_max_new_tokens", type=int, default=128)
+    p.add_argument("--gen_limit_dev", type=int, default=3, help="Number of dev examples to run generation on (random; 0=disable)")
+    p.add_argument("--gen_limit_test", type=int, default=10, help="Number of test examples to run generation on (random; 0=disable)")
+    p.add_argument("--gen_seed", type=int, default=42, help="Seed for generation sampling")
     p.add_argument("--eval_preview_samples", type=int, default=3)
     p.add_argument("--save_top_k", type=int, default=10)
     p.add_argument("--lambda_con", type=float, default=0.2, help="Weight for contrastive loss")
@@ -940,7 +1049,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--contrastive_dim", type=int, default=768, help="Projection dim for contrastive space")
     p.add_argument("--queue_size", type=int, default=32768, help="Size of contrastive feature queue")
     p.add_argument("--num_queue_negs", type=int, default=64, help="Number of queue negatives for matching loss")
-    p.add_argument("--dev_eval_steps", type=int, default=100000, help="Evaluate on dev set every N steps instead of per epoch")
+    p.add_argument(
+        "--dev_eval_steps",
+        type=int,
+        default=-1,
+        help="Dev eval frequency: -1=half-epoch (default), 0=per-epoch, >0=every N steps",
+    )
+    p.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience in epochs (based on dev improvements)")
     p.add_argument("--skip_final_test_eval", action="store_true", help="Skip final test evaluation after training (runs by default if --test_jsonl provided)")
     return p
 
@@ -952,4 +1067,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
