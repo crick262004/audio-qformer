@@ -75,6 +75,16 @@ GEN_LIMIT_TEST=10
 LAMBDA_CON=0.2
 LAMBDA_MATCH=0.1
 
+# Check for checkpoint to resume from
+CHECKPOINT_DIR="${OUTPUT_DIR}/last_checkpoint"
+RESUME_FLAG=""
+if [ -d "$CHECKPOINT_DIR" ]; then
+    echo "Found checkpoint at ${CHECKPOINT_DIR}, resuming training..."
+    RESUME_FLAG="--resume_from_checkpoint ${CHECKPOINT_DIR}"
+else
+    echo "No checkpoint found, starting training from scratch..."
+fi
+
 # Run training
 srun python train_qformer_llm.py \
     --dataset_jsonl "$DATASET_JSONL" \
@@ -100,6 +110,7 @@ srun python train_qformer_llm.py \
     --use_fp16 \
     --gradient_checkpointing \
     --save_top_k 10 \
-    --early_stop_patience 2
+    --early_stop_patience 2 \
+    $RESUME_FLAG
 
 echo "Training completed!"

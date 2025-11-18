@@ -317,6 +317,9 @@ def collate_to_fbank(
     translator: Translator,
     batch: List[Sample],
 ) -> Tuple[torch.Tensor, Optional[Any], List[str], List[str], List[str]]:
+    # Feature extraction now runs on main process with GPU access
+    # No need to force CPU processing since we're not in DataLoader workers
+    
     decoded_list: List[Dict[str, Any]] = []
     targets: List[str] = []
     inst_and_lang: List[str] = []
@@ -337,6 +340,7 @@ def collate_to_fbank(
     collated = translator.collate(decoded_list)
     fbank_seqdata = collated["fbank"]
     seqs, padding_mask = get_seqs_and_padding_mask(fbank_seqdata)
+    
     return seqs, padding_mask, targets, inst_and_lang, audio_paths
 
 
@@ -396,6 +400,130 @@ class TopKCheckpointManager:
         self._prune_if_needed()
         self._persist()
         return ckpt_dir
+
+
+def save_full_checkpoint(
+    checkpoint_dir: Path,
+    qformer,
+    projector,
+    align,
+    optimizer,
+    scheduler,
+    epoch: int,
+    global_step: int,
+    best_dev: float,
+    rank: int,
+) -> None:
+    """
+    Save a complete checkpoint with all training state.
+    Only the main process (rank 0) saves the checkpoint.
+    """
+    if rank != 0:
+        return
+    
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save model states
+    torch.save(unwrap_model(qformer).state_dict(), checkpoint_dir / "qformer.pt")
+    torch.save(unwrap_model(projector).state_dict(), checkpoint_dir / "projector.pt")
+    torch.save(unwrap_model(align).state_dict(), checkpoint_dir / "align_heads.pt")
+    
+    # Save optimizer and scheduler states
+    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+    
+    # Save training progress metadata
+    metadata = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_dev": best_dev,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng_state": np.random.get_state() if PYDUB_AVAILABLE else None,
+        "python_rng_state": random.getstate(),
+    }
+    torch.save(metadata, checkpoint_dir / "metadata.pt")
+    
+    logger.info(f"Saved full checkpoint to {checkpoint_dir} (epoch={epoch}, step={global_step})")
+
+
+def load_full_checkpoint(
+    checkpoint_dir: Path,
+    qformer,
+    projector,
+    align,
+    optimizer,
+    scheduler,
+    device: torch.device,
+) -> Tuple[int, int, float]:
+    """
+    Load a complete checkpoint and restore all training state.
+    Returns: (start_epoch, global_step, best_dev)
+    """
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+    
+    logger.info(f"Loading checkpoint from {checkpoint_dir}")
+    
+    # Load model states
+    qformer_state = torch.load(checkpoint_dir / "qformer.pt", map_location=device)
+    projector_state = torch.load(checkpoint_dir / "projector.pt", map_location=device)
+    align_state = torch.load(checkpoint_dir / "align_heads.pt", map_location=device)
+    
+    unwrap_model(qformer).load_state_dict(qformer_state)
+    unwrap_model(projector).load_state_dict(projector_state)
+    unwrap_model(align).load_state_dict(align_state)
+    
+    # Load optimizer state
+    optimizer_state = torch.load(checkpoint_dir / "optimizer.pt", map_location=device)
+    optimizer.load_state_dict(optimizer_state)
+    
+    # Load scheduler state if it exists
+    scheduler_path = checkpoint_dir / "scheduler.pt"
+    if scheduler is not None and scheduler_path.exists():
+        scheduler_state = torch.load(scheduler_path, map_location=device)
+        scheduler.load_state_dict(scheduler_state)
+    
+    # Load training progress metadata
+    metadata = torch.load(checkpoint_dir / "metadata.pt", map_location=device)
+    epoch = metadata["epoch"]
+    global_step = metadata["global_step"]
+    best_dev = metadata["best_dev"]
+    
+    # Restore random states
+    try:
+        torch.set_rng_state(metadata["torch_rng_state"].cpu())
+    except Exception as e:
+        logger.warning(f"Could not restore torch RNG state: {e}")
+    
+    if metadata["cuda_rng_state"] is not None and torch.cuda.is_available():
+        try:
+            # Ensure cuda_rng_state is a list of ByteTensors
+            cuda_states = metadata["cuda_rng_state"]
+            if isinstance(cuda_states, list):
+                # Convert each state to ByteTensor if needed
+                cuda_states = [s.to(torch.uint8) if not s.dtype == torch.uint8 else s for s in cuda_states]
+                torch.cuda.set_rng_state_all(cuda_states)
+            else:
+                logger.warning(f"CUDA RNG state has unexpected type: {type(cuda_states)}")
+        except Exception as e:
+            logger.warning(f"Could not restore CUDA RNG state: {e}")
+    
+    if metadata["numpy_rng_state"] is not None and PYDUB_AVAILABLE:
+        try:
+            np.random.set_state(metadata["numpy_rng_state"])
+        except Exception as e:
+            logger.warning(f"Could not restore numpy RNG state: {e}")
+    
+    try:
+        random.setstate(metadata["python_rng_state"])
+    except Exception as e:
+        logger.warning(f"Could not restore Python RNG state: {e}")
+    
+    logger.info(f"Resumed from checkpoint: epoch={epoch}, step={global_step}, best_dev={best_dev:.4f}")
+    
+    return epoch, global_step, best_dev
 
 
 def _build_eval_batch(
@@ -498,10 +626,11 @@ def evaluate_dataset(
     num_preview: int = 3,
 ) -> Tuple[float, List[Dict[str, str]]]:
     ds = JsonlSummDataset(Path(dataset_jsonl))
-    def collate_fn(samples: List[Sample]) -> Tuple[torch.Tensor, Any, List[str], List[str], List[str]]:
-        return collate_to_fbank(translator, samples)
+    def collate_fn(samples: List[Sample]) -> List[Sample]:
+        # Return raw samples - feature extraction will be done in eval loop on GPU
+        return samples
 
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, prefetch_factor=None, collate_fn=collate_fn)
 
     total_loss = 0.0
     total_count = 0
@@ -526,7 +655,10 @@ def evaluate_dataset(
     llama.eval()
 
     global_offset = 0
-    for seqs, padding_mask, targets, insts, audio_paths in tqdm(loader, desc=f"Evaluating {split_name}"):
+    for batch in tqdm(loader, desc=f"Evaluating {split_name}"):
+        # Do feature extraction on main process with GPU
+        seqs, padding_mask, targets, insts, audio_paths = collate_to_fbank(translator, batch)
+        
         seqs = seqs.to(device=device, dtype=dtype)
         if padding_mask is not None and hasattr(padding_mask, "to"):
             padding_mask = padding_mask.to(device)
@@ -758,8 +890,9 @@ def train(args: argparse.Namespace) -> None:
     optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
     ds = JsonlSummDataset(Path(args.dataset_jsonl))
-    def collate_fn(samples: List[Sample]) -> Tuple[torch.Tensor, Any, List[str], List[str], List[str]]:
-        return collate_to_fbank(translator, samples)
+    def collate_fn(samples: List[Sample]) -> List[Sample]:
+        # Return raw samples - feature extraction will be done in main training loop on GPU
+        return samples
 
     # Use DistributedSampler for distributed training
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
@@ -768,7 +901,8 @@ def train(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         shuffle=(sampler is None),  # Don't shuffle when using DistributedSampler
         sampler=sampler,
-        num_workers=0,
+        num_workers=0,  # Set to 0 since feature extraction now happens in main process
+        prefetch_factor=None,  # Not needed with num_workers=0
         collate_fn=collate_fn
     )
 
@@ -791,23 +925,44 @@ def train(args: argparse.Namespace) -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     step = 0
+    best_dev = float("inf")
+    start_epoch = 0
+    
+    # Load checkpoint if resuming
+    if args.resume_from_checkpoint is not None:
+        checkpoint_path = Path(args.resume_from_checkpoint)
+        if checkpoint_path.exists():
+            start_epoch, step, best_dev = load_full_checkpoint(
+                checkpoint_dir=checkpoint_path,
+                qformer=qformer,
+                projector=projector,
+                align=align,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+            )
+            if is_main_process():
+                logger.info(f"Successfully resumed from checkpoint at epoch {start_epoch}, step {step}")
+        else:
+            if is_main_process():
+                logger.warning(f"Checkpoint path {checkpoint_path} does not exist. Starting from scratch.")
+    
     qformer.train()
     projector.train()
     align.train()
     llama.train() if any(p.requires_grad for p in llama.parameters()) else llama.eval()
 
     topk_mgr = TopKCheckpointManager(Path(args.output_dir) / "best", k=args.save_top_k)
-    best_dev = float("inf")
     no_improve_epochs = 0
 
     # Track total training time
     training_start_time = time.time()
     if is_main_process():
         logger.info("=" * 80)
-        logger.info(f"Starting training for {args.epochs} epochs")
+        logger.info(f"Starting training for {args.epochs} epochs (starting from epoch {start_epoch})")
         logger.info("=" * 80)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # Set epoch for DistributedSampler to ensure proper shuffling
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -820,7 +975,10 @@ def train(args: argparse.Namespace) -> None:
         half_epoch_done = False
         improved_this_epoch = False
 
-        for seqs, padding_mask, targets, insts, _audio_paths in epoch_loader:
+        for batch in epoch_loader:
+            # NOW do feature extraction on main process with GPU
+            seqs, padding_mask, targets, insts, _audio_paths = collate_to_fbank(translator, batch)
+            
             step += 1
             batches_in_epoch += 1
             seqs = seqs.to(device=device, dtype=dtype)
@@ -1089,6 +1247,24 @@ def train(args: argparse.Namespace) -> None:
             if dist.is_initialized():
                 dist.barrier()
 
+        # Save full checkpoint at the end of each epoch
+        last_ckpt_dir = Path(args.output_dir) / "last_checkpoint"
+        save_full_checkpoint(
+            checkpoint_dir=last_ckpt_dir,
+            qformer=qformer,
+            projector=projector,
+            align=align,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch + 1,  # Save as next epoch to resume from
+            global_step=step,
+            best_dev=best_dev,
+            rank=get_rank(),
+        )
+        # Barrier to ensure all processes wait for checkpoint saving
+        if dist.is_initialized():
+            dist.barrier()
+
         # Early stopping check (based on dev improvements within the epoch)
         if args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl):
             if improved_this_epoch:
@@ -1212,6 +1388,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience in epochs (based on dev improvements)")
     p.add_argument("--skip_final_test_eval", action="store_true", help="Skip final test evaluation after training (runs by default if --test_jsonl provided)")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume training from")
     return p
 
 

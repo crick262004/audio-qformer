@@ -151,3 +151,4 @@ wandb/
 *.mp4
 data/
 datasets/
+qformer_quick_test_run/*
