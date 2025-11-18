@@ -49,11 +49,10 @@ export NCCL_DEBUG=INFO
 # export NCCL_NET_GDR_LEVEL=5
 # export NCCL_SOCKET_IFNAME=ib0
 
-# Option 2: If you have Ethernet (most common) - TRY THIS FIRST
+# Option 2: If you have Ethernet (most common) - CONFIGURED FOR YOUR CLUSTER
 export NCCL_IB_DISABLE=1           # Disable InfiniBand, use Ethernet
-export NCCL_SOCKET_IFNAME=eth0     # Replace eth0 with your network interface
-                                    # Common names: eth0, eno1, ens3, enp0s3
-                                    # Check with: ip addr show
+export NCCL_SOCKET_IFNAME=eno1     # Your cluster network interface (172.24.16.132/24)
+                                    # Detected from: ip addr show
 
 # Option 3: Let NCCL auto-detect but exclude virtual/loopback
 # export NCCL_IB_DISABLE=1
