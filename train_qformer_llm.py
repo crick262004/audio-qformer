@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -701,11 +702,12 @@ def train(args: argparse.Namespace) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load LLM to specific device (not "auto" to avoid multi-GPU splitting in distributed training)
     llama = _from_pretrained_with_optional_token(
         AutoModelForCausalLM.from_pretrained,
         llm_repo_id,
         torch_dtype=dtype,
-        device_map="auto",
+        device_map={"": device},  # Explicitly load to current device
     )
     if args.llm_lora is not None and args.llm_lora != "":
         from peft import PeftModel
@@ -788,6 +790,13 @@ def train(args: argparse.Namespace) -> None:
     topk_mgr = TopKCheckpointManager(Path(args.output_dir) / "best", k=args.save_top_k)
     best_dev = float("inf")
     no_improve_epochs = 0
+
+    # Track total training time
+    training_start_time = time.time()
+    if is_main_process():
+        logger.info("=" * 80)
+        logger.info(f"Starting training for {args.epochs} epochs")
+        logger.info("=" * 80)
 
     for epoch in range(args.epochs):
         # Set epoch for DistributedSampler to ensure proper shuffling
@@ -912,12 +921,17 @@ def train(args: argparse.Namespace) -> None:
                     scheduler.step()
 
             if step % args.log_every == 0 and is_main_process():
+                elapsed_time = time.time() - training_start_time
+                hours, remainder = divmod(int(elapsed_time), 3600)
+                minutes, seconds = divmod(remainder, 60)
                 loss_info = (
-                    f"epoch={epoch} step={step} loss={(float(loss) * args.grad_accum_steps):.4f} "
+                    f"epoch={epoch} step={step} elapsed={hours:02d}:{minutes:02d}:{seconds:02d} "
+                    f"loss={(float(loss) * args.grad_accum_steps):.4f} "
                     f"lm={float(lm_loss):.4f} con={float(L_con):.4f} match={float(L_match):.4f}"
                 )
                 logger.info(loss_info)
                 epoch_loader.set_postfix({
+                    'elapsed': f"{hours:02d}:{minutes:02d}:{seconds:02d}",
                     'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
                     'lm': f"{float(lm_loss):.4f}",
                     'con': f"{float(L_con):.4f}",
@@ -1078,6 +1092,15 @@ def train(args: argparse.Namespace) -> None:
             if no_improve_epochs >= args.early_stop_patience:
                 logger.info("Early stopping triggered due to no dev improvement.")
                 break
+
+    # Log total training time
+    total_training_time = time.time() - training_start_time
+    if is_main_process():
+        hours, remainder = divmod(int(total_training_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        logger.info("=" * 80)
+        logger.info(f"Training completed! Total time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        logger.info("=" * 80)
 
     # Save final checkpoints only on main process
     if is_main_process():
