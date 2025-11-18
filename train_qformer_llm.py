@@ -8,7 +8,6 @@ import os
 import shutil
 import time
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from math import ceil
@@ -62,15 +61,9 @@ def setup_distributed():
         local_rank = 0
 
     if world_size > 1:
-        # Try NCCL first, fall back to Gloo if NCCL fails
-        try:
-            dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=30))
-            logger.info(f"Initialized distributed training with NCCL: rank={rank}, world_size={world_size}, local_rank={local_rank}")
-        except Exception as e:
-            logger.warning(f"NCCL initialization failed: {e}, falling back to Gloo backend")
-            dist.init_process_group(backend="gloo", init_method="env://", timeout=timedelta(minutes=30))
-            logger.info(f"Initialized distributed training with Gloo: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
+        logger.info(f"Initialized distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
     else:
         logger.info("Running in single-process mode")
 
@@ -681,8 +674,8 @@ def train(args: argparse.Namespace) -> None:
         rid = repo_id.strip()
         lower = rid.lower()
         aliases = {
-            "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
-            "meta-llama/llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+            "llama-3-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/llama-3-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
             "llama-3-8b": "meta-llama/Meta-Llama-3-8B",
             "meta-llama/llama-3-8b": "meta-llama/Meta-Llama-3-8B",
         }
@@ -1158,10 +1151,6 @@ def train(args: argparse.Namespace) -> None:
         if is_main_process():
             logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
 
-    # Barrier before cleanup to ensure all processes (especially rank 0 after test eval) reach cleanup together
-    if dist.is_initialized():
-        dist.barrier()
-
     # Clean up distributed training
     cleanup_distributed()
 
@@ -1170,7 +1159,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train Q-Former + projector for audio->LLM summarization")
     p.add_argument("--dataset_jsonl", type=str, default=f"{DATA_DIR}/train.jsonl", help="Path to JSONL with {audio, summary, [tgt_lang], [instruction]}")
     p.add_argument("--model_name", type=str, default="seamlessM4T_v2_large", help="UnitY model name")
-    p.add_argument("--llm_model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct", help="HF model name for Llama")
+    p.add_argument("--llm_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="HF model name for Llama")
     p.add_argument(
         "--hf_token",
         type=str,
