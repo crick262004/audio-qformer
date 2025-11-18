@@ -746,6 +746,12 @@ def train(args: argparse.Namespace) -> None:
         if is_main_process():
             logger.info("Wrapped models with DistributedDataParallel")
 
+    # Create references to unwrapped models for accessing custom methods/attributes
+    # (DDP doesn't expose custom methods, only forward())
+    qformer_module = unwrap_model(qformer)
+    projector_module = unwrap_model(projector)
+    align_module = unwrap_model(align)
+
     params = list(qformer.parameters()) + list(projector.parameters()) + list(align.parameters())
     if any(p.requires_grad for p in llama.parameters()):
         params += [p for p in llama.parameters() if p.requires_grad]
@@ -841,15 +847,15 @@ def train(args: argparse.Namespace) -> None:
                 mask = tgt_attn_mask.float().unsqueeze(-1)
                 t_pool = (t_input_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
-            qz, tz = align.forward_proj(q_pool, t_pool.to(device=device, dtype=train_dtype))
+            qz, tz = align_module.forward_proj(q_pool, t_pool.to(device=device, dtype=train_dtype))
             L_con = contrastive_loss_bidir(
                 qz,
                 tz,
                 audio_feats=audio_queue.feats.to(qz.device),
                 text_feats=text_queue.feats.to(qz.device),
-                logit_scale=align.logit_scale.clamp(0, 5).exp(),
+                logit_scale=align_module.logit_scale.clamp(0, 5).exp(),
             )
-            L_match = matching_loss(align, qz, tz, queue_feats=text_queue.feats.to(qz.device), num_queue_negs=args.num_queue_negs)
+            L_match = matching_loss(align_module, qz, tz, queue_feats=text_queue.feats.to(qz.device), num_queue_negs=args.num_queue_negs)
 
             for i in range(len(targets)):
                 instruction = insts[i]
