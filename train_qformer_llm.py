@@ -8,6 +8,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from math import ceil
@@ -61,9 +62,15 @@ def setup_distributed():
         local_rank = 0
 
     if world_size > 1:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # Try NCCL first, fall back to Gloo if NCCL fails
+        try:
+            dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=30))
+            logger.info(f"Initialized distributed training with NCCL: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+        except Exception as e:
+            logger.warning(f"NCCL initialization failed: {e}, falling back to Gloo backend")
+            dist.init_process_group(backend="gloo", init_method="env://", timeout=timedelta(minutes=30))
+            logger.info(f"Initialized distributed training with Gloo: rank={rank}, world_size={world_size}, local_rank={local_rank}")
         torch.cuda.set_device(local_rank)
-        logger.info(f"Initialized distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
     else:
         logger.info("Running in single-process mode")
 
