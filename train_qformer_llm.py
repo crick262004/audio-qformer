@@ -1151,6 +1151,10 @@ def train(args: argparse.Namespace) -> None:
         if is_main_process():
             logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
 
+    # Barrier before cleanup to ensure all processes (especially rank 0 after test eval) reach cleanup together
+    if dist.is_initialized():
+        dist.barrier()
+
     # Clean up distributed training
     cleanup_distributed()
 
