@@ -16,8 +16,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 DATA_DIR = "."
 
@@ -37,6 +39,65 @@ from seamless_communication.inference.translator import Translator
 from fairseq2.nn.padding import get_seqs_and_padding_mask
 
 logger = logging.getLogger("train_qformer_llm")
+
+
+def setup_distributed():
+    """Initialize distributed training environment."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    elif "SLURM_PROCID" in os.environ:
+        rank = int(os.environ["SLURM_PROCID"])
+        world_size = int(os.environ["SLURM_NTASKS"])
+        local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    if world_size > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        logger.info(f"Initialized distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+    else:
+        logger.info("Running in single-process mode")
+
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def get_rank():
+    """Get the rank of the current process."""
+    if not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_world_size():
+    """Get the total number of processes."""
+    if not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def unwrap_model(model):
+    """Unwrap model from DDP wrapper if needed."""
+    if isinstance(model, DDP):
+        return model.module
+    return model
 
 
 class AlignHeads(nn.Module):
@@ -556,16 +617,30 @@ def evaluate_dataset(
 
 
 def train(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s -- %(name)s: %(message)s")
+    # Initialize distributed training
+    rank, world_size, local_rank = setup_distributed()
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Only main process should log at INFO level
+    log_level = logging.INFO if is_main_process() else logging.WARNING
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s -- %(name)s: %(message)s")
+
+    # Use local_rank to set device for distributed training
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
     use_fp16 = (args.use_fp16 or not args.no_fp16) and torch.cuda.is_available()
     dtype = torch.float16 if use_fp16 else torch.float32
     amp_enabled = dtype == torch.float16 and device.type == "cuda"
-    
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+    if is_main_process():
+        logger.info(f"Training on {world_size} processes with device={device}, dtype={dtype}, amp_enabled={amp_enabled}")
 
     translator = Translator(
         args.model_name,
@@ -658,6 +733,14 @@ def train(args: argparse.Namespace) -> None:
     text_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
     audio_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
 
+    # Wrap models with DDP for distributed training
+    if world_size > 1:
+        qformer = DDP(qformer, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        projector = DDP(projector, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        align = DDP(align, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        if is_main_process():
+            logger.info("Wrapped models with DistributedDataParallel")
+
     params = list(qformer.parameters()) + list(projector.parameters()) + list(align.parameters())
     if any(p.requires_grad for p in llama.parameters()):
         params += [p for p in llama.parameters() if p.requires_grad]
@@ -667,7 +750,16 @@ def train(args: argparse.Namespace) -> None:
     def collate_fn(samples: List[Sample]) -> Tuple[torch.Tensor, Any, List[str], List[str], List[str]]:
         return collate_to_fbank(translator, samples)
 
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    # Use DistributedSampler for distributed training
+    sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=(sampler is None),  # Don't shuffle when using DistributedSampler
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=collate_fn
+    )
 
     try:
         from transformers import get_cosine_schedule_with_warmup
@@ -698,7 +790,11 @@ def train(args: argparse.Namespace) -> None:
     no_improve_epochs = 0
 
     for epoch in range(args.epochs):
-        epoch_loader = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        # Set epoch for DistributedSampler to ensure proper shuffling
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
+        epoch_loader = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main_process())
         # Track per-epoch progress for half-epoch dev eval
         batches_in_epoch = 0
         total_batches_this_epoch = len(loader)
@@ -815,18 +911,19 @@ def train(args: argparse.Namespace) -> None:
                 if scheduler is not None:
                     scheduler.step()
 
-            if step % args.log_every == 0:
+            if step % args.log_every == 0 and is_main_process():
                 loss_info = (
                     f"epoch={epoch} step={step} loss={(float(loss) * args.grad_accum_steps):.4f} "
                     f"lm={float(lm_loss):.4f} con={float(L_con):.4f} match={float(L_match):.4f}"
                 )
                 logger.info(loss_info)
-                epoch_loader.set_postfix({
-                    'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
-                    'lm': f"{float(lm_loss):.4f}",
-                    'con': f"{float(L_con):.4f}",
-                    'match': f"{float(L_match):.4f}"
-                })
+                if not is_main_process():
+                    epoch_loader.set_postfix({
+                        'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
+                        'lm': f"{float(lm_loss):.4f}",
+                        'con': f"{float(L_con):.4f}",
+                        'match': f"{float(L_match):.4f}"
+                    })
 
             # Step-based dev eval (only if > 0)
             if (args.dev_eval_steps > 0 and step > 0 and step % args.dev_eval_steps == 0 and 
@@ -856,17 +953,22 @@ def train(args: argparse.Namespace) -> None:
                 if dev_loss < best_dev:
                     improved_this_epoch = True
                     best_dev = dev_loss
-                for j, ex in enumerate(previews):
-                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
-                state = {
-                    "qformer": qformer.state_dict(),
-                    "projector": projector.state_dict(),
-                    "align": align.state_dict(),
-                }
-                tag = f"epoch{epoch}_step{step}"
-                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
-                if saved_dir is not None:
-                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                if is_main_process():
+                    for j, ex in enumerate(previews):
+                        logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                    # Unwrap models from DDP before saving
+                    state = {
+                        "qformer": unwrap_model(qformer).state_dict(),
+                        "projector": unwrap_model(projector).state_dict(),
+                        "align": unwrap_model(align).state_dict(),
+                    }
+                    tag = f"epoch{epoch}_step{step}"
+                    saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                    if saved_dir is not None:
+                        logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                # Barrier to ensure all processes wait for checkpoint saving
+                if dist.is_initialized():
+                    dist.barrier()
 
             # Half-epoch dev eval (default when --dev_eval_steps == -1)
             if (args.dev_eval_steps == -1 and not half_epoch_done and
@@ -897,17 +999,22 @@ def train(args: argparse.Namespace) -> None:
                 if dev_loss < best_dev:
                     improved_this_epoch = True
                     best_dev = dev_loss
-                for j, ex in enumerate(previews):
-                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
-                state = {
-                    "qformer": qformer.state_dict(),
-                    "projector": projector.state_dict(),
-                    "align": align.state_dict(),
-                }
-                tag = f"epoch{epoch}_step{step}_half"
-                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
-                if saved_dir is not None:
-                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                if is_main_process():
+                    for j, ex in enumerate(previews):
+                        logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                    # Unwrap models from DDP before saving
+                    state = {
+                        "qformer": unwrap_model(qformer).state_dict(),
+                        "projector": unwrap_model(projector).state_dict(),
+                        "align": unwrap_model(align).state_dict(),
+                    }
+                    tag = f"epoch{epoch}_step{step}_half"
+                    saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                    if saved_dir is not None:
+                        logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                # Barrier to ensure all processes wait for checkpoint saving
+                if dist.is_initialized():
+                    dist.barrier()
                 half_epoch_done = True
 
             if args.max_steps > 0 and step >= args.max_steps:
@@ -943,17 +1050,22 @@ def train(args: argparse.Namespace) -> None:
             if dev_loss < best_dev:
                 improved_this_epoch = True
                 best_dev = dev_loss
-            for j, ex in enumerate(previews):
-                logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
-            state = {
-                "qformer": qformer.state_dict(),
-                "projector": projector.state_dict(),
-                "align": align.state_dict(),
-            }
-            tag = f"epoch{epoch}_step{step}"
-            saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
-            if saved_dir is not None:
-                logger.info(f"Saved top-k checkpoint to {saved_dir}")
+            if is_main_process():
+                for j, ex in enumerate(previews):
+                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                # Unwrap models from DDP before saving
+                state = {
+                    "qformer": unwrap_model(qformer).state_dict(),
+                    "projector": unwrap_model(projector).state_dict(),
+                    "align": unwrap_model(align).state_dict(),
+                }
+                tag = f"epoch{epoch}_step{step}"
+                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                if saved_dir is not None:
+                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+            # Barrier to ensure all processes wait for checkpoint saving
+            if dist.is_initialized():
+                dist.barrier()
 
         # Early stopping check (based on dev improvements within the epoch)
         if args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl):
@@ -968,14 +1080,22 @@ def train(args: argparse.Namespace) -> None:
                 logger.info("Early stopping triggered due to no dev improvement.")
                 break
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(qformer.state_dict(), out_dir / "qformer.pt")
-    torch.save(projector.state_dict(), out_dir / "projector.pt")
-    torch.save(align.state_dict(), out_dir / "align_heads.pt")
-    logger.info(f"Saved Q-Former, projector, and align heads to {out_dir}")
+    # Save final checkpoints only on main process
+    if is_main_process():
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Unwrap models from DDP before saving
+        torch.save(unwrap_model(qformer).state_dict(), out_dir / "qformer.pt")
+        torch.save(unwrap_model(projector).state_dict(), out_dir / "projector.pt")
+        torch.save(unwrap_model(align).state_dict(), out_dir / "align_heads.pt")
+        logger.info(f"Saved Q-Former, projector, and align heads to {out_dir}")
 
-    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not args.skip_final_test_eval:
+    # Barrier to ensure all processes wait for final checkpoint saving
+    if dist.is_initialized():
+        dist.barrier()
+
+    out_dir = Path(args.output_dir)  # Define out_dir for all processes
+    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not args.skip_final_test_eval and is_main_process():
         eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
         test_pred_path = out_dir / "test_predictions.jsonl"
         test_loss, previews = evaluate_dataset(
@@ -1003,7 +1123,11 @@ def train(args: argparse.Namespace) -> None:
             json.dump({"avg_lm_loss": test_loss}, f, indent=2)
         logger.info(f"Wrote test predictions to {test_pred_path} and metrics to test_metrics.json")
     else:
-        logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
+        if is_main_process():
+            logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
+
+    # Clean up distributed training
+    cleanup_distributed()
 
 
 def build_argparser() -> argparse.ArgumentParser:
