@@ -917,13 +917,12 @@ def train(args: argparse.Namespace) -> None:
                     f"lm={float(lm_loss):.4f} con={float(L_con):.4f} match={float(L_match):.4f}"
                 )
                 logger.info(loss_info)
-                if not is_main_process():
-                    epoch_loader.set_postfix({
-                        'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
-                        'lm': f"{float(lm_loss):.4f}",
-                        'con': f"{float(L_con):.4f}",
-                        'match': f"{float(L_match):.4f}"
-                    })
+                epoch_loader.set_postfix({
+                    'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
+                    'lm': f"{float(lm_loss):.4f}",
+                    'con': f"{float(L_con):.4f}",
+                    'match': f"{float(L_match):.4f}"
+                })
 
             # Step-based dev eval (only if > 0)
             if (args.dev_eval_steps > 0 and step > 0 and step % args.dev_eval_steps == 0 and 

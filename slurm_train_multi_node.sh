@@ -47,7 +47,8 @@ export NCCL_IB_HCA=mlx5               # InfiniBand adapter (adjust if needed)
 export NCCL_NET_GDR_LEVEL=5           # GPU Direct RDMA level
 
 # CUDA settings
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# NOTE: Do not set CUDA_VISIBLE_DEVICES - SLURM handles GPU assignment automatically
+# SLURM assigns the requested GPUs (2 per node) and sets CUDA_VISIBLE_DEVICES correctly
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # OMP settings for better CPU performance
@@ -69,10 +70,14 @@ MODEL_NAME="seamlessM4T_v2_large"
 
 # Training hyperparameters
 EPOCHS=5
-# With 4 GPUs, reduce batch size per GPU and gradient accumulation
-BATCH_SIZE=1              # Per-GPU batch size
-GRAD_ACCUM_STEPS=2        # Reduced since we have 4 GPUs (effective batch = 4 * 1 * 2 = 8)
-LR=1e-4
+# Optimized for A100 GPUs (can fit batch_size=8 per GPU)
+# Option A: Match single-GPU effective batch (recommended for comparing results)
+BATCH_SIZE=2              # Per-GPU batch size
+GRAD_ACCUM_STEPS=1        # No accumulation needed (effective batch = 4 * 2 * 1 = 8)
+# Option B: Maximize throughput (uncomment to use, adjust LR to 2e-4)
+# BATCH_SIZE=8            # Max per A100 (effective batch = 4 * 8 * 1 = 32)
+# GRAD_ACCUM_STEPS=1
+LR=1e-4                   # Use 2e-4 if using batch_size=8
 WEIGHT_DECAY=0.01
 
 # Q-Former config
