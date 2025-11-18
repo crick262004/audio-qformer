@@ -52,6 +52,9 @@ def setup_distributed():
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
         local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+        # Set RANK and LOCAL_RANK for PyTorch's env:// init_method
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
     else:
         rank = 0
         world_size = 1
