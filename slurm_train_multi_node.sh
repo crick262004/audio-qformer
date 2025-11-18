@@ -41,10 +41,26 @@ export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
 # NCCL settings for optimal multi-node performance
 export NCCL_DEBUG=INFO
-export NCCL_IB_DISABLE=0              # Enable InfiniBand (if available)
-export NCCL_SOCKET_IFNAME=^docker0,lo # Exclude docker/loopback interfaces
-export NCCL_IB_HCA=mlx5               # InfiniBand adapter (adjust if needed)
-export NCCL_NET_GDR_LEVEL=5           # GPU Direct RDMA level
+
+# CRITICAL: Configure network interface for your cluster
+# Option 1: If you have InfiniBand (check with `ibstat`)
+# export NCCL_IB_DISABLE=0
+# export NCCL_IB_HCA=mlx5
+# export NCCL_NET_GDR_LEVEL=5
+# export NCCL_SOCKET_IFNAME=ib0
+
+# Option 2: If you have Ethernet (most common) - TRY THIS FIRST
+export NCCL_IB_DISABLE=1           # Disable InfiniBand, use Ethernet
+export NCCL_SOCKET_IFNAME=eth0     # Replace eth0 with your network interface
+                                    # Common names: eth0, eno1, ens3, enp0s3
+                                    # Check with: ip addr show
+
+# Option 3: Let NCCL auto-detect but exclude virtual/loopback
+# export NCCL_IB_DISABLE=1
+# export NCCL_SOCKET_IFNAME=^docker0,lo,virbr0,veth
+
+# Timeout settings (increase if nodes are slow to connect)
+export NCCL_SOCKET_TIMEOUT=300000  # 5 minutes timeout
 
 # CUDA settings
 # NOTE: Do not set CUDA_VISIBLE_DEVICES - SLURM handles GPU assignment automatically
