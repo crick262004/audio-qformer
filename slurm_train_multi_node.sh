@@ -73,7 +73,7 @@ MODEL_NAME="seamlessM4T_v2_large"
 EPOCHS=100
 # Optimized for A100 GPUs - increased batch_size for better throughput
 # Memory usage is 32-46%, so batch_size=16 should fit comfortably
-BATCH_SIZE=8             # Per-GPU batch size (effective batch = 4 * 8 * 1 = 32)
+BATCH_SIZE=16             # Per-GPU batch size (effective batch = 4 * 16 * 1 = 64)
 GRAD_ACCUM_STEPS=1        # No accumulation needed
 LR=2e-4                   # Learning rate for batch_size=16
 WEIGHT_DECAY=0.01
