@@ -1,0 +1,13 @@
+{
+  "num_samples": 500,
+  "num_valid_samples": 500,
+  "avg_pred_words": 63.54,
+  "avg_ref_words": 18.312,
+  "length_ratio": 3.4698558322411532,
+  "wer": 3.110528615115771,
+  "cer": 2.8246154469732283,
+  "rouge1": 0.27506636918031074,
+  "rouge2": 0.22098236499729032,
+  "rougeL": 0.25832464810445865,
+  "exact_match_rate": 0.0
+}

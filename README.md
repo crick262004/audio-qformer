@@ -171,7 +171,24 @@ python "train_qformer_llm.py" --max_steps 1 --batch_size 1 --grad_accum_steps 1 
 | `--lambda_con` | Contrastive loss weight | 0.2 |
 | `--lambda_match` | Matching loss weight | 0.1 |
 | `--use_fp16` | Enable mixed precision | False |
-| `--gradient_checkpointing` | Save memory via checkpointing | False |
+| `--gradient_checkpointing` | Save memory via checkpointing | True |
+| `--epochs` | Number of training epochs | 5 |
+| `--dev_eval_steps` | Dev eval frequency | -1 (half-epoch) |
+| `--early_stop_patience` | Early stopping patience (epochs) | 2 |
+
+### Eval Sampling
+- Randomly limit LLM generation during eval to speed up runs, while computing LM loss on the full split.
+- Flags:
+  - `--gen_limit_dev` (default 3): number of dev examples to generate
+  - `--gen_limit_test` (default 10): number of test examples to generate
+  - `--gen_seed` (default 42): seed for reproducible sampling
+  
+Example: `python train_qformer_llm.py --gen_limit_dev 3 --gen_limit_test 10 --gen_seed 42`
+
+### Dev Eval Frequency
+- Default: half-epoch and end-of-epoch (`--dev_eval_steps -1`).
+- Per-epoch only: `--dev_eval_steps 0`.
+- Step-based: `--dev_eval_steps N` (evaluate every N training steps).
 
 ## References
 

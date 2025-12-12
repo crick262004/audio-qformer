@@ -151,3 +151,5 @@ wandb/
 *.mp4
 data/
 datasets/
+qformer_quick_test_run/*
+qformer_distributed_run/best/best_checkpoints.json

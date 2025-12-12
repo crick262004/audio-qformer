@@ -22,10 +22,12 @@ The script handles data loading, model setup, the main training loop, periodic
 evaluation, and checkpoint management."""
 
 import argparse
+import random
 import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -36,8 +38,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 DATA_DIR = "."
 
@@ -60,6 +64,68 @@ from seamless_communication.inference.translator import Translator
 from fairseq2.nn.padding import get_seqs_and_padding_mask # for handling batched sequences
 
 logger = logging.getLogger("train_qformer_llm")
+
+
+def setup_distributed():
+    """Initialize distributed training environment."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    elif "SLURM_PROCID" in os.environ:
+        rank = int(os.environ["SLURM_PROCID"])
+        world_size = int(os.environ["SLURM_NTASKS"])
+        local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+        # Set RANK and LOCAL_RANK for PyTorch's env:// init_method
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    if world_size > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        logger.info(f"Initialized distributed training: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+    else:
+        logger.info("Running in single-process mode")
+
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def get_rank():
+    """Get the rank of the current process."""
+    if not dist.is_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_world_size():
+    """Get the total number of processes."""
+    if not dist.is_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def unwrap_model(model):
+    """Unwrap model from DDP wrapper if needed."""
+    if isinstance(model, DDP):
+        return model.module
+    return model
 
 
 class AlignHeads(nn.Module):
@@ -384,6 +450,7 @@ def collate_to_fbank(
     collated = translator.collate(decoded_list)
     fbank_seqdata = collated["fbank"]
     seqs, padding_mask = get_seqs_and_padding_mask(fbank_seqdata)
+    
     return seqs, padding_mask, targets, inst_and_lang, audio_paths
 
 
@@ -574,6 +641,8 @@ def evaluate_dataset(
     amp_enabled: bool,
     batch_size: int,
     gen_max_new_tokens: int,
+    gen_limit: int,
+    gen_seed: int,
     save_predictions_path: Optional[Path] = None,
     num_preview: int = 3,
 ) -> Tuple[float, List[Dict[str, str]]]:
@@ -585,14 +654,26 @@ def evaluate_dataset(
     Results and previews are logged and can be saved to a file.
     """
     ds = JsonlSummDataset(Path(dataset_jsonl))
-    def collate_fn(samples: List[Sample]) -> Tuple[torch.Tensor, Any, List[str], List[str], List[str]]:
-        return collate_to_fbank(translator, samples)
+    def collate_fn(samples: List[Sample]) -> List[Sample]:
+        # Return raw samples - feature extraction will be done in eval loop on GPU
+        return samples
 
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, prefetch_factor=None, collate_fn=collate_fn)
 
     total_loss = 0.0
     total_count = 0
     previews: List[Dict[str, str]] = []
+
+    # Prepare sampling for generation
+    ds_len = len(ds)
+    limit = max(0, min(int(gen_limit), ds_len))
+    if limit > 0:
+        rng = random.Random(int(gen_seed))
+        selected_indices = set(rng.sample(range(ds_len), limit))
+        logger.info(f"{split_name}: generation sampling {limit}/{ds_len} (seed={gen_seed}), indices={sorted(list(selected_indices))}")
+    else:
+        selected_indices = set()
+        logger.info(f"{split_name}: generation sampling disabled (gen_limit={gen_limit})")
 
     if save_predictions_path is not None:
         save_predictions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -675,11 +756,44 @@ def evaluate_dataset(
             if len(previews) >= num_preview:
                 break
 
-        if save_predictions_path is not None:
-            with save_predictions_path.open("a", encoding="utf-8") as f:
-                for a, p, r in zip(audio_paths, preds, targets):
-                    rec = {"audio": a, "prediction": p.strip(), "reference": r}
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            index_tensor = torch.tensor(local_selected, device=gen_inputs.device, dtype=torch.long)
+            gen_inputs_sel = gen_inputs.index_select(0, index_tensor)
+            gen_attn_sel = gen_attn.index_select(0, index_tensor)
+
+            gen_out = llama.generate(
+                inputs_embeds=gen_inputs_sel,
+                attention_mask=gen_attn_sel,
+                max_new_tokens=gen_max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+            gen_tokens_only = gen_out[:, gen_inputs_sel.size(1):]
+            preds_sel = tokenizer.batch_decode(gen_tokens_only, skip_special_tokens=True)
+
+            # Add previews from sampled items only
+            for idx_in_batch, pred_text in zip(local_selected, preds_sel):
+                if len(previews) >= num_preview:
+                    break
+                previews.append({
+                    "audio": audio_paths[idx_in_batch],
+                    "pred": pred_text.strip(),
+                    "ref": targets[idx_in_batch],
+                })
+
+            # Persist predictions if requested
+            if save_predictions_path is not None:
+                with save_predictions_path.open("a", encoding="utf-8") as f:
+                    for idx_in_batch, pred_text in zip(local_selected, preds_sel):
+                        rec = {
+                            "audio": audio_paths[idx_in_batch],
+                            "prediction": pred_text.strip(),
+                            "reference": targets[idx_in_batch],
+                        }
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        global_offset += bs
 
     avg_loss = total_loss / max(1, total_count)
     logger.info(f"{split_name} avg_lm_loss={avg_loss:.4f}")
@@ -704,7 +818,7 @@ def train(args: argparse.Namespace) -> None:
     use_fp16 = (args.use_fp16 or not args.no_fp16) and torch.cuda.is_available()
     dtype = torch.float16 if use_fp16 else torch.float32
     amp_enabled = dtype == torch.float16 and device.type == "cuda"
-    
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -742,8 +856,8 @@ def train(args: argparse.Namespace) -> None:
         rid = repo_id.strip()
         lower = rid.lower()
         aliases = {
-            "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
-            "meta-llama/llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+            "llama-3-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/llama-3-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
             "llama-3-8b": "meta-llama/Meta-Llama-3-8B",
             "meta-llama/llama-3-8b": "meta-llama/Meta-Llama-3-8B",
         }
@@ -753,7 +867,7 @@ def train(args: argparse.Namespace) -> None:
 
     # Handle Hugging Face authentication for gated models.
     hf_token = (
-        (args.hf_token if getattr(args, "hf_token", None) else None)
+        args.hf_token
         or os.getenv("HF_TOKEN")
         or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     )
@@ -774,6 +888,7 @@ def train(args: argparse.Namespace) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load LLM to specific device (not "auto" to avoid multi-GPU splitting in distributed training)
     llama = _from_pretrained_with_optional_token(
         AutoModelForCausalLM.from_pretrained,
         llm_repo_id,
@@ -838,10 +953,21 @@ def train(args: argparse.Namespace) -> None:
 
     # Setup the data loader for the training set.
     ds = JsonlSummDataset(Path(args.dataset_jsonl))
-    def collate_fn(samples: List[Sample]) -> Tuple[torch.Tensor, Any, List[str], List[str], List[str]]:
-        return collate_to_fbank(translator, samples)
+    def collate_fn(samples: List[Sample]) -> List[Sample]:
+        # Return raw samples - feature extraction will be done in main training loop on GPU
+        return samples
 
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    # Use DistributedSampler for distributed training
+    sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=(sampler is None),  # Don't shuffle when using DistributedSampler
+        sampler=sampler,
+        num_workers=0,  # Set to 0 since feature extraction now happens in main process
+        prefetch_factor=None,  # Not needed with num_workers=0
+        collate_fn=collate_fn
+    )
 
     # Setup a cosine learning rate scheduler with a warmup phase.
     try:
@@ -873,11 +999,32 @@ def train(args: argparse.Namespace) -> None:
     llama.train() if any(p.requires_grad for p in llama.parameters()) else llama.eval()
 
     topk_mgr = TopKCheckpointManager(Path(args.output_dir) / "best", k=args.save_top_k)
-    best_dev = float("inf")
+    no_improve_epochs = 0
 
-    for epoch in range(args.epochs):
-        epoch_loader = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for seqs, padding_mask, targets, insts, _audio_paths in epoch_loader:
+    # Track total training time
+    training_start_time = time.time()
+    if is_main_process():
+        logger.info("=" * 80)
+        logger.info(f"Starting training for {args.epochs} epochs (starting from epoch {start_epoch})")
+        logger.info("=" * 80)
+
+    for epoch in range(start_epoch, args.epochs):
+        # Set epoch for DistributedSampler to ensure proper shuffling
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
+        epoch_loader = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not is_main_process())
+        # Track per-epoch progress for half-epoch dev eval
+        batches_in_epoch = 0
+        total_batches_this_epoch = len(loader)
+        half_point = max(1, total_batches_this_epoch // 2)
+        half_epoch_done = False
+        improved_this_epoch = False
+
+        for batch in epoch_loader:
+            # NOW do feature extraction on main process with GPU
+            seqs, padding_mask, targets, insts, _audio_paths = collate_to_fbank(translator, batch)
+            
             step += 1
             # Move data to the appropriate device.
             seqs = seqs.to(device=device, dtype=dtype)
@@ -916,9 +1063,9 @@ def train(args: argparse.Namespace) -> None:
                 tz,
                 audio_feats=audio_queue.feats.to(qz.device),
                 text_feats=text_queue.feats.to(qz.device),
-                logit_scale=align.logit_scale.clamp(0, 5).exp(),
+                logit_scale=align_module.logit_scale.clamp(0, 5).exp(),
             )
-            L_match = matching_loss(align, qz, tz, queue_feats=text_queue.feats.to(qz.device), num_queue_negs=args.num_queue_negs)
+            L_match = matching_loss(align_module, qz, tz, queue_feats=text_queue.feats.to(qz.device), num_queue_negs=args.num_queue_negs)
 
             # --- 5d. Construct input and calculate LLM loss ---
             # This is done sample-by-sample and then padded, due to the complexity
@@ -1021,11 +1168,13 @@ def train(args: argparse.Namespace) -> None:
             if step % args.log_every == 0:
                 # Log the current loss values to the console and progress bar.
                 loss_info = (
-                    f"epoch={epoch} step={step} loss={(float(loss) * args.grad_accum_steps):.4f} "
+                    f"epoch={epoch} step={step} elapsed={hours:02d}:{minutes:02d}:{seconds:02d} "
+                    f"loss={(float(loss) * args.grad_accum_steps):.4f} "
                     f"lm={float(lm_loss):.4f} con={float(L_con):.4f} match={float(L_match):.4f}"
                 )
                 logger.info(loss_info)
                 epoch_loader.set_postfix({
+                    'elapsed': f"{hours:02d}:{minutes:02d}:{seconds:02d}",
                     'loss': f"{(float(loss) * args.grad_accum_steps):.4f}",
                     'lm': f"{float(lm_loss):.4f}",
                     'con': f"{float(L_con):.4f}",
@@ -1052,21 +1201,77 @@ def train(args: argparse.Namespace) -> None:
                     amp_enabled=amp_enabled,
                     batch_size=eval_bs,
                     gen_max_new_tokens=args.gen_max_new_tokens,
+                    gen_limit=args.gen_limit_dev,
+                    gen_seed=args.gen_seed,
                     save_predictions_path=None,
                     num_preview=args.eval_preview_samples,
                 )
-                best_dev = min(best_dev, dev_loss)
-                for j, ex in enumerate(previews):
-                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
-                state = {
-                    "qformer": qformer.state_dict(),
-                    "projector": projector.state_dict(),
-                    "align": align.state_dict(),
-                }
-                tag = f"epoch{epoch}_step{step}"
-                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
-                if saved_dir is not None:
-                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                if dev_loss < best_dev:
+                    improved_this_epoch = True
+                    best_dev = dev_loss
+                if is_main_process():
+                    for j, ex in enumerate(previews):
+                        logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                    # Unwrap models from DDP before saving
+                    state = {
+                        "qformer": unwrap_model(qformer).state_dict(),
+                        "projector": unwrap_model(projector).state_dict(),
+                        "align": unwrap_model(align).state_dict(),
+                    }
+                    tag = f"epoch{epoch}_step{step}"
+                    saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                    if saved_dir is not None:
+                        logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                # Barrier to ensure all processes wait for checkpoint saving
+                if dist.is_initialized():
+                    dist.barrier()
+
+            # Half-epoch dev eval (default when --dev_eval_steps == -1)
+            if (args.dev_eval_steps == -1 and not half_epoch_done and
+                args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl) and
+                batches_in_epoch >= half_point):
+                eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
+                dev_loss, previews = evaluate_dataset(
+                    split_name="dev",
+                    dataset_jsonl=args.dev_jsonl,
+                    translator=translator,
+                    tokenizer=tokenizer,
+                    emb_layer=emb_layer,
+                    sep_emb_static=sep_emb_static,
+                    qformer=qformer,
+                    projector=projector,
+                    llama=llama,
+                    device=device,
+                    dtype=dtype,
+                    train_dtype=train_dtype,
+                    amp_enabled=amp_enabled,
+                    batch_size=eval_bs,
+                    gen_max_new_tokens=args.gen_max_new_tokens,
+                    gen_limit=args.gen_limit_dev,
+                    gen_seed=args.gen_seed,
+                    save_predictions_path=None,
+                    num_preview=args.eval_preview_samples,
+                )
+                if dev_loss < best_dev:
+                    improved_this_epoch = True
+                    best_dev = dev_loss
+                if is_main_process():
+                    for j, ex in enumerate(previews):
+                        logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                    # Unwrap models from DDP before saving
+                    state = {
+                        "qformer": unwrap_model(qformer).state_dict(),
+                        "projector": unwrap_model(projector).state_dict(),
+                        "align": unwrap_model(align).state_dict(),
+                    }
+                    tag = f"epoch{epoch}_step{step}_half"
+                    saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                    if saved_dir is not None:
+                        logger.info(f"Saved top-k checkpoint to {saved_dir}")
+                # Barrier to ensure all processes wait for checkpoint saving
+                if dist.is_initialized():
+                    dist.barrier()
+                half_epoch_done = True
 
             if args.max_steps > 0 and step >= args.max_steps:
                 break
@@ -1093,30 +1298,87 @@ def train(args: argparse.Namespace) -> None:
                 amp_enabled=amp_enabled,
                 batch_size=eval_bs,
                 gen_max_new_tokens=args.gen_max_new_tokens,
+                gen_limit=args.gen_limit_dev,
+                gen_seed=args.gen_seed,
                 save_predictions_path=None,
                 num_preview=args.eval_preview_samples,
             )
-            best_dev = min(best_dev, dev_loss)
-            for j, ex in enumerate(previews):
-                logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
-            state = {
-                "qformer": qformer.state_dict(),
-                "projector": projector.state_dict(),
-                "align": align.state_dict(),
-            }
-            tag = f"epoch{epoch}_step{step}"
-            saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
-            if saved_dir is not None:
-                logger.info(f"Saved top-k checkpoint to {saved_dir}")
+            if dev_loss < best_dev:
+                improved_this_epoch = True
+                best_dev = dev_loss
+            if is_main_process():
+                for j, ex in enumerate(previews):
+                    logger.info(f"[dev sample {j+1}] ref={ex['ref'][:200]} | pred={ex['pred'][:200]} | audio={ex['audio']}")
+                # Unwrap models from DDP before saving
+                state = {
+                    "qformer": unwrap_model(qformer).state_dict(),
+                    "projector": unwrap_model(projector).state_dict(),
+                    "align": unwrap_model(align).state_dict(),
+                }
+                tag = f"epoch{epoch}_step{step}"
+                saved_dir = topk_mgr.maybe_save(dev_loss, tag, state)
+                if saved_dir is not None:
+                    logger.info(f"Saved top-k checkpoint to {saved_dir}")
+            # Barrier to ensure all processes wait for checkpoint saving
+            if dist.is_initialized():
+                dist.barrier()
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(qformer.state_dict(), out_dir / "qformer.pt")
-    torch.save(projector.state_dict(), out_dir / "projector.pt")
-    torch.save(align.state_dict(), out_dir / "align_heads.pt")
-    logger.info(f"Saved Q-Former, projector, and align heads to {out_dir}")
+        # Save full checkpoint at the end of each epoch
+        last_ckpt_dir = Path(args.output_dir) / "last_checkpoint"
+        save_full_checkpoint(
+            checkpoint_dir=last_ckpt_dir,
+            qformer=qformer,
+            projector=projector,
+            align=align,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch + 1,  # Save as next epoch to resume from
+            global_step=step,
+            best_dev=best_dev,
+            rank=get_rank(),
+        )
+        # Barrier to ensure all processes wait for checkpoint saving
+        if dist.is_initialized():
+            dist.barrier()
 
-    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not getattr(args, 'skip_final_test_eval', False):
+        # Early stopping check (based on dev improvements within the epoch)
+        if args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl):
+            if improved_this_epoch:
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+                logger.info(
+                    f"No dev improvement in epoch {epoch+1}. Patience {no_improve_epochs}/{args.early_stop_patience}"
+                )
+            if no_improve_epochs >= args.early_stop_patience:
+                logger.info("Early stopping triggered due to no dev improvement.")
+                break
+
+    # Log total training time
+    total_training_time = time.time() - training_start_time
+    if is_main_process():
+        hours, remainder = divmod(int(total_training_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        logger.info("=" * 80)
+        logger.info(f"Training completed! Total time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        logger.info("=" * 80)
+
+    # Save final checkpoints only on main process
+    if is_main_process():
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Unwrap models from DDP before saving
+        torch.save(unwrap_model(qformer).state_dict(), out_dir / "qformer.pt")
+        torch.save(unwrap_model(projector).state_dict(), out_dir / "projector.pt")
+        torch.save(unwrap_model(align).state_dict(), out_dir / "align_heads.pt")
+        logger.info(f"Saved Q-Former, projector, and align heads to {out_dir}")
+
+    # Barrier to ensure all processes wait for final checkpoint saving
+    if dist.is_initialized():
+        dist.barrier()
+
+    out_dir = Path(args.output_dir)  # Define out_dir for all processes
+    if args.test_jsonl is not None and os.path.isfile(args.test_jsonl) and not args.skip_final_test_eval and is_main_process():
         eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
         test_pred_path = out_dir / "test_predictions.jsonl"
         test_loss, previews = evaluate_dataset(
@@ -1135,6 +1397,8 @@ def train(args: argparse.Namespace) -> None:
             amp_enabled=amp_enabled,
             batch_size=eval_bs,
             gen_max_new_tokens=args.gen_max_new_tokens,
+            gen_limit=args.gen_limit_test,
+            gen_seed=args.gen_seed,
             save_predictions_path=test_pred_path,
             num_preview=args.eval_preview_samples,
         )
@@ -1142,7 +1406,11 @@ def train(args: argparse.Namespace) -> None:
             json.dump({"avg_lm_loss": test_loss}, f, indent=2)
         logger.info(f"Wrote test predictions to {test_pred_path} and metrics to test_metrics.json")
     else:
-        logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
+        if is_main_process():
+            logger.info("Skipping final test evaluation. Use --skip_final_test_eval to disable or provide --test_jsonl.")
+
+    # Clean up distributed training
+    cleanup_distributed()
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1152,7 +1420,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train Q-Former + projector for audio->LLM summarization")
     p.add_argument("--dataset_jsonl", type=str, default=f"{DATA_DIR}/train.jsonl", help="Path to JSONL with {audio, summary, [tgt_lang], [instruction]}")
     p.add_argument("--model_name", type=str, default="seamlessM4T_v2_large", help="UnitY model name")
-    p.add_argument("--llm_model_name", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct", help="HF model name for Llama")
+    p.add_argument("--llm_model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="HF model name for Llama")
     p.add_argument(
         "--hf_token",
         type=str,
@@ -1163,7 +1431,7 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--llm_lora", type=str, default=None, help="Optional LoRA adapter path for Llama")
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
@@ -1172,7 +1440,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--use_fp16", action="store_true", help="Use mixed precision training")
     p.add_argument("--no_fp16", action="store_true", help="Disable mixed precision (fp16 enabled by default)")
-    p.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
+    p.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
     p.add_argument("--qformer_layers", type=int, default=2)
     p.add_argument("--qformer_heads", type=int, default=8)
     p.add_argument("--qformer_queries", type=int, default=16)
@@ -1181,6 +1449,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--test_jsonl", type=str, default=f"{DATA_DIR}/test.jsonl")
     p.add_argument("--eval_batch_size", type=int, default=1, help="Eval batch size (defaults to train batch size)")
     p.add_argument("--gen_max_new_tokens", type=int, default=128)
+    p.add_argument("--gen_limit_dev", type=int, default=3, help="Number of dev examples to run generation on (random; 0=disable)")
+    p.add_argument("--gen_limit_test", type=int, default=10, help="Number of test examples to run generation on (random; 0=disable)")
+    p.add_argument("--gen_seed", type=int, default=42, help="Seed for generation sampling")
     p.add_argument("--eval_preview_samples", type=int, default=3)
     p.add_argument("--save_top_k", type=int, default=10)
     p.add_argument("--lambda_con", type=float, default=0.2, help="Weight for contrastive loss")
@@ -1188,8 +1459,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--contrastive_dim", type=int, default=768, help="Projection dim for contrastive space")
     p.add_argument("--queue_size", type=int, default=32768, help="Size of contrastive feature queue")
     p.add_argument("--num_queue_negs", type=int, default=64, help="Number of queue negatives for matching loss")
-    p.add_argument("--dev_eval_steps", type=int, default=100000, help="Evaluate on dev set every N steps instead of per epoch")
+    p.add_argument(
+        "--dev_eval_steps",
+        type=int,
+        default=-1,
+        help="Dev eval frequency: -1=half-epoch (default), 0=per-epoch, >0=every N steps",
+    )
+    p.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience in epochs (based on dev improvements)")
     p.add_argument("--skip_final_test_eval", action="store_true", help="Skip final test evaluation after training (runs by default if --test_jsonl provided)")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume training from")
     return p
 
 
@@ -1200,4 +1478,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
