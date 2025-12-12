@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+Main training script for the Audio Q-Former model.
+
+This script orchestrates the entire fine-tuning process for bridging a pre-trained
+audio encoder (SeamlessM4T) with a Large Language Model (e.g., Llama 3.1). It leverages
+a multi-part loss function to learn a meaningful alignment between audio and text
+representations.
+
+The core training components are:
+1.  A frozen SeamlessM4T model to extract rich audio features.
+2.  A trainable AudioQFormer and Projector that learn to distill and map these
+    audio features into the LLM's embedding space.
+3.  A frozen (or LoRA-finetuned) LLM that generates text summaries based on the
+    processed audio context.
+4.  A sophisticated loss function combining:
+    - Language Modeling Loss (Cross-Entropy) for fluent text generation.
+    - Bidirectional Contrastive Loss (InfoNCE) for audio-text alignment.
+    - Binary Matching Loss for fine-grained pair discrimination.
+
+The script handles data loading, model setup, the main training loop, periodic
+evaluation, and checkpoint management."""
 
 import argparse
 import random
@@ -24,6 +45,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 DATA_DIR = "."
 
+# Optional dependency for handling more audio formats like M4A.
 try:
     from pydub import AudioSegment
     import numpy as np
@@ -31,13 +53,15 @@ try:
 except ImportError:
     PYDUB_AVAILABLE = False
 
+# Import core model architecture components.
 from audio_llm_bridge import (
     AudioQFormer,
     AudioQFormerConfig,
     SimpleProjector,
 )
+# Import the high-level interface for SeamlessM4T.
 from seamless_communication.inference.translator import Translator
-from fairseq2.nn.padding import get_seqs_and_padding_mask
+from fairseq2.nn.padding import get_seqs_and_padding_mask # for handling batched sequences
 
 logger = logging.getLogger("train_qformer_llm")
 
@@ -105,79 +129,129 @@ def unwrap_model(model):
 
 
 class AlignHeads(nn.Module):
+    """
+    Contains the projection and classification heads for the alignment losses.
+
+    This module is central to the contrastive learning framework. It learns to project
+    audio and text features into a shared embedding space where their similarity can
+    be measured for the InfoNCE loss. It also contains a classifier head to
+    predict whether an audio-text pair is a positive match for the matching loss.
+    """
     def __init__(self, d_q: int, d_t: int, d_con: int = 768) -> None:
         super().__init__()
+        # Projection head for audio (query) features for InfoNCE loss.
+        # A small neural network (a projection head) that takes the pooled audio features from the Q-Former and projects them into the shared contrastive space.
         self.q_proj = nn.Sequential(
             nn.LayerNorm(d_q), nn.Linear(d_q, d_con), nn.GELU(), nn.Linear(d_con, d_con)
         )
+        # Projection head for text features for InfoNCE loss. Similar to above, but for text features.
         self.t_proj = nn.Sequential(
             nn.LayerNorm(d_t), nn.Linear(d_t, d_con), nn.GELU(), nn.Linear(d_con, d_con)
         )
+        # Binary classifier head for the audio-text matching loss.
+        # A classifier that takes a concatenated audio-text pair and predicts if they match (a binary classification task for the matching_loss).
         self.match_head = nn.Sequential(
             nn.Linear(2 * d_con, 256), nn.GELU(), nn.Linear(256, 1)
         )
+        # A learnable temperature parameter used in the contrastive loss to control the sharpness of the probability distribution, helping to stabilize training.
         self.logit_scale = nn.Parameter(torch.tensor(2.6593))
 
     def forward_proj(self, q_pool: torch.Tensor, t_pool: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Projects audio and text features into the shared space and normalizes them.
+
+        This method takes the pooled audio (q_pool) and text (t_pool) features, passes them through their respective projection heads (q_proj, t_proj), and normalizes them. Normalization ensures that the similarity calculation (dot product) is equivalent to cosine similarity.
+        """
         qz = F.normalize(self.q_proj(q_pool), dim=-1)
         tz = F.normalize(self.t_proj(t_pool), dim=-1)
         return qz, tz
 
 
 class ContrastiveQueue:
+    """
+    A memory bank for storing a large number of feature vectors (negatives).
+
+    This queue provides a richer set of negative samples for contrastive learning
+    than what is available in a single batch. It operates as a fixed-size FIFO
+    (First-In, First-Out) buffer.
+    """
     def __init__(self, d_con: int, K: int = 32768, device: str = "cuda") -> None:
         self.K = K
         self.registered = False
         self.device = device
-        self.ptr = 0
+        self.ptr = 0 # keeps track of the current position to insert new features.
+        # Initialize a buffer to store the feature vectors.
         self.feats = torch.zeros(K, d_con, device=device)
 
     @torch.no_grad()
     def enqueue(self, tz: torch.Tensor) -> None:
+        """This method adds new features to the queue in a First-In, First-Out (FIFO) manner. It overwrites the oldest features once the queue is full. The @torch.no_grad() decorator ensures that no gradients are computed for this operation."""
         B = tz.shape[0]
         if B == 0:
             return
+        # Handle cases where the batch is larger than the queue.
         if B >= self.K:
             self.feats.copy_(tz[-self.K :])
             self.ptr = 0
             return
+        # Find the start and end pointers for insertion.
         end = self.ptr + B
         if end <= self.K:
+            # Simple case: fits without wrapping around.
             self.feats[self.ptr:end] = tz
         else:
+            # Case: wraps around the end of the buffer.
             remain = self.K - self.ptr
             self.feats[self.ptr:] = tz[:remain]
             self.feats[: B - remain] = tz[remain:]
+        # Update the pointer.
         self.ptr = (self.ptr + B) % self.K
 
 
+# These functions calculate the InfoNCE contrastive loss. The goal is to maximize the similarity between a correct audio-text pair while minimizing its similarity with all other "negative" samples in the batch and in the contrastive queue.
 def contrastive_loss(qz: torch.Tensor, tz: torch.Tensor, queue_feats: Optional[torch.Tensor] = None, logit_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Calculates the uni-directional InfoNCE contrastive loss."""
     B = qz.size(0)
+    # Combine in-batch negatives with negatives from the queue.
     if queue_feats is not None and queue_feats.numel() > 0:
         all_t = torch.cat([tz, queue_feats.detach()], dim=0)
     else:
         all_t = tz
     scale = logit_scale if logit_scale is not None else 1.0
+    # Calculate similarity scores (logits) between audio and all text features.
     logits = (qz @ all_t.t())
     logits = logits * scale
+    # The target for each audio sample is its corresponding text sample (at index 0 to B-1).
     target = torch.arange(B, device=qz.device, dtype=torch.long)
     loss = F.cross_entropy(logits, target)
     return loss
 
 
 def matching_loss(align: AlignHeads, qz: torch.Tensor, tz: torch.Tensor, queue_feats: Optional[torch.Tensor] = None, num_queue_negs: int = 0) -> torch.Tensor:
+    """
+    Calculates the binary audio-text matching (ATM) loss.
+
+    It frames the alignment task as a simple binary classification problem.
+    Simple Binary Cross-Entropy Loss (BCE) is used here because the task is a binary classification:
+
+    This loss trains a classifier to distinguish between correct (positive) pairs
+    and incorrect (negative) pairs.
+    """
     B = qz.size(0)
 
+    # Positive Pairs: It concatenates the correct audio (qz) and text (tz) features and passes them to the align.match_head to get a "match" score. The target label is 1 (True).
     pos_pairs = torch.cat([qz, tz], dim=-1)
     pos_logits = align.match_head(pos_pairs).squeeze(-1)
     pos_labels = torch.ones(B, device=qz.device)
 
+    # Negative Pairs: It creates negative examples by shuffling the text features within the batch (in-batch negatives) and by pairing audio features with random text features from the contrastive queue (queue negatives). The target label for these is 0 (False).
     idx = torch.randperm(B, device=qz.device)
     tz_shuf = tz[idx]
     neg_pairs_ib = torch.cat([qz, tz_shuf], dim=-1)
     neg_logits_ib = align.match_head(neg_pairs_ib).squeeze(-1)
     neg_labels_ib = torch.zeros(B, device=qz.device)
 
+    # Negative pairs (from queue): sample random text features from the queue.
     if queue_feats is not None and num_queue_negs > 0 and queue_feats.numel() > 0:
         K = min(num_queue_negs, queue_feats.size(0))
         rand_idx = torch.randint(0, queue_feats.size(0), (K,), device=qz.device)
@@ -188,12 +262,14 @@ def matching_loss(align: AlignHeads, qz: torch.Tensor, tz: torch.Tensor, queue_f
         neg_logits_q = align.match_head(neg_pairs_q).squeeze(-1)
         neg_labels_q = torch.zeros(B * K, device=qz.device)
 
+        # Combine all logits and labels.
         logits = torch.cat([pos_logits, neg_logits_ib, neg_logits_q], dim=0)
         labels = torch.cat([pos_labels, neg_labels_ib, neg_labels_q], dim=0)
     else:
         logits = torch.cat([pos_logits, neg_logits_ib], dim=0)
         labels = torch.cat([pos_labels, neg_labels_ib], dim=0)
 
+    # Calculate binary cross-entropy loss.
     return F.binary_cross_entropy_with_logits(logits, labels)
 
 
@@ -204,6 +280,13 @@ def contrastive_loss_bidir(
     text_feats: Optional[torch.Tensor] = None,
     logit_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Calculates the full bidirectional InfoNCE contrastive loss.
+
+    This computes the loss in both directions (audio-to-text and text-to-audio)
+    and averages them for a more robust alignment signal.
+    Is the one primarily used.
+    """
     if text_feats is None or text_feats.numel() == 0:
         all_t = tz
     else:
@@ -215,18 +298,24 @@ def contrastive_loss_bidir(
 
     B = qz.size(0)
     scale = logit_scale if logit_scale is not None else 1.0
+    target = torch.arange(B, device=qz.device, dtype=torch.long)
 
+    # Audio-to-text loss: It compares each audio query (qz) to all text features (all_t), aiming for the highest score with its true text partner
     logits_a2t = scale * (qz @ all_t.t())
     target = torch.arange(B, device=qz.device, dtype=torch.long)
     loss_a2t = F.cross_entropy(logits_a2t, target)
 
+    # Text-to-audio loss: It does the reverse, comparing each text query (tz) to all audio features (all_q).
     logits_t2a = scale * (tz @ all_q.t())
     loss_t2a = F.cross_entropy(logits_t2a, target)
+
+    # The final loss is the average of these two directional losses, ensuring robust alignment
     return 0.5 * (loss_a2t + loss_t2a)
 
 
 @dataclass
 class Sample:
+    """A simple dataclass to hold one training example. (A simple data structure to hold the information for one training example)"""
     audio_path: str
     summary_text: str
     tgt_lang: Optional[str]
@@ -234,6 +323,11 @@ class Sample:
 
 
 class JsonlSummDataset(Dataset[Sample]):
+    """
+    A standard PyTorch Dataset to load samples from a .jsonl file.
+    
+    This class reads a .jsonl file (where each line is a JSON object), parses each line into a Sample object, and serves them up for training.
+    """
     def __init__(self, jsonl_path: Path) -> None:
         super().__init__()
         self.samples: List[Sample] = []
@@ -259,9 +353,15 @@ class JsonlSummDataset(Dataset[Sample]):
 
 
 def load_audio_16k(path: str) -> torch.Tensor:
+    """
+    A robust audio loading function that loads an audio file, resamples it to 16kHz,
+    converts it to mono, and returns it as a PyTorch tensor. It includes a fallback
+    to the `pydub` library for formats not supported by `torchaudio`.
+    """
     try:
         wav, sr = torchaudio.load(path)
     except Exception as e:
+        # Fallback to pydub for formats like M4A if available.
         if PYDUB_AVAILABLE and path.lower().endswith(('.m4a', '.aac', '.mp4')):
             print(f"torchaudio failed to load {path}, falling back to pydub: {e}")
             try:
@@ -276,7 +376,9 @@ def load_audio_16k(path: str) -> torch.Tensor:
                 if audio is None:
                     audio = AudioSegment.from_file(path)
                 
+                # Resample to 16kHz and convert to mono.
                 audio = audio.set_channels(1).set_frame_rate(16000)
+                # Normalize samples to float32 in range [-1, 1].
                 samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
                 if audio.sample_width == 2:
                     samples = samples / 32768.0
@@ -300,8 +402,10 @@ def load_audio_16k(path: str) -> torch.Tensor:
             else:
                 raise e
     
+    # Resample if necessary.
     if sr != 16_000:
         wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=16_000)
+    # Ensure audio is mono and has shape (samples, 1).
     if wav.dim() == 2:
         if wav.size(0) > 1:
             wav = wav.mean(dim=0, keepdim=True)
@@ -317,26 +421,32 @@ def collate_to_fbank(
     translator: Translator,
     batch: List[Sample],
 ) -> Tuple[torch.Tensor, Optional[Any], List[str], List[str], List[str]]:
-    # Feature extraction now runs on main process with GPU access
-    # No need to force CPU processing since we're not in DataLoader workers
-    
+    """
+    The collate function for the DataLoader. It takes a batch of Samples, loads the
+    audio waveforms, and uses the SeamlessM4T processor (via the Translator object)
+    to convert them into log-mel filterbank (fbank) features, which are the
+    input to the audio encoder.
+    """
     decoded_list: List[Dict[str, Any]] = []
     targets: List[str] = []
     inst_and_lang: List[str] = []
     audio_paths: List[str] = []
 
-    for s in batch:
+    for s in batch: # It iterates through the samples, loading each audio file using load_audio_16k.
         wav = load_audio_16k(s.audio_path)
         decoded_audio = {"waveform": wav, "sample_rate": 16_000, "format": -1}
+        # It uses the translator.convert_to_fbank method from SeamlessM4T to convert the raw audio waveforms into log-mel filterbank features, which are the standard input for audio transformers.
         out = translator.convert_to_fbank(decoded_audio)
         decoded_list.append(out)
         targets.append(s.summary_text)
         audio_paths.append(s.audio_path)
+        # Prepare the instruction prompt for the LLM.
         inst = s.instruction or "Summarize the following speech succinctly."
         if s.tgt_lang is not None:
             inst = f"{inst}\nTarget language: {s.tgt_lang}."
         inst_and_lang.append(inst)
 
+    # (Collation) It bundles these features, text targets, and instructions into a single batch of tensors, handling necessary padding for sequences of different lengths.
     collated = translator.collate(decoded_list)
     fbank_seqdata = collated["fbank"]
     seqs, padding_mask = get_seqs_and_padding_mask(fbank_seqdata)
@@ -344,17 +454,30 @@ def collate_to_fbank(
     return seqs, padding_mask, targets, inst_and_lang, audio_paths
 
 
+# Utilities for training and checkpointing.
+
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
+    """
+    A helper function to recursively set the requires_grad attribute of a module's parameters.
+
+    A simple helper function to either freeze or unfreeze all parameters of a given PyTorch module. This is used to freeze the weights of the pre-trained SeamlessM4T encoder and (optionally) the LLM, so that only the Q-Former, projector, and alignment heads are trained.
+    """
     for p in module.parameters():
         p.requires_grad = flag
 
 
 class TopKCheckpointManager:
+    """
+    A utility to manage model checkpoints, saving only the top 'k' best performing
+    models based on a validation metric (e.g., loss). This prevents filling up
+    disk space with suboptimal checkpoints.
+    """
     def __init__(self, save_dir: Path, k: int = 10) -> None:
         self.save_dir = save_dir
         self.k = k
         self.entries: List[Dict[str, Any]] = []
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        # Load existing checkpoint index if it exists.
         self.index_path = self.save_dir / "best_checkpoints.json"
         if self.index_path.exists():
             try:
@@ -363,10 +486,12 @@ class TopKCheckpointManager:
                 self.entries = []
 
     def _persist(self) -> None:
+        """Saves the current index of best checkpoints to a JSON file."""
         with self.index_path.open("w", encoding="utf-8") as f:
             json.dump(sorted(self.entries, key=lambda x: x["metric"]), f, indent=2)
 
     def _prune_if_needed(self) -> None:
+        """If more than 'k' checkpoints exist, it removes the worst one."""
         if len(self.entries) <= self.k:
             return
         self.entries.sort(key=lambda x: x["metric"])
@@ -385,13 +510,18 @@ class TopKCheckpointManager:
         tag: str,
         state: Dict[str, Any],
     ) -> Optional[Path]:
+        """
+        Saves a new checkpoint if its metric is better than the worst of the
+        current top 'k' checkpoints.
+        """
         if len(self.entries) >= self.k:
             worst = max(self.entries, key=lambda x: x["metric"])
-            if metric_value >= worst["metric"]:
+            if metric_value >= worst["metric"]: # Assuming lower is better.
                 return None
 
         ckpt_dir = self.save_dir / f"{tag}_loss{metric_value:.4f}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Save the state of the trainable modules.
         torch.save(state["qformer"], ckpt_dir / "qformer.pt")
         torch.save(state["projector"], ckpt_dir / "projector.pt")
         torch.save(state["align"], ckpt_dir / "align_heads.pt")
@@ -402,130 +532,7 @@ class TopKCheckpointManager:
         return ckpt_dir
 
 
-def save_full_checkpoint(
-    checkpoint_dir: Path,
-    qformer,
-    projector,
-    align,
-    optimizer,
-    scheduler,
-    epoch: int,
-    global_step: int,
-    best_dev: float,
-    rank: int,
-) -> None:
-    """
-    Save a complete checkpoint with all training state.
-    Only the main process (rank 0) saves the checkpoint.
-    """
-    if rank != 0:
-        return
-    
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save model states
-    torch.save(unwrap_model(qformer).state_dict(), checkpoint_dir / "qformer.pt")
-    torch.save(unwrap_model(projector).state_dict(), checkpoint_dir / "projector.pt")
-    torch.save(unwrap_model(align).state_dict(), checkpoint_dir / "align_heads.pt")
-    
-    # Save optimizer and scheduler states
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
-    if scheduler is not None:
-        torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
-    
-    # Save training progress metadata
-    metadata = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "best_dev": best_dev,
-        "torch_rng_state": torch.get_rng_state(),
-        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        "numpy_rng_state": np.random.get_state() if PYDUB_AVAILABLE else None,
-        "python_rng_state": random.getstate(),
-    }
-    torch.save(metadata, checkpoint_dir / "metadata.pt")
-    
-    logger.info(f"Saved full checkpoint to {checkpoint_dir} (epoch={epoch}, step={global_step})")
-
-
-def load_full_checkpoint(
-    checkpoint_dir: Path,
-    qformer,
-    projector,
-    align,
-    optimizer,
-    scheduler,
-    device: torch.device,
-) -> Tuple[int, int, float]:
-    """
-    Load a complete checkpoint and restore all training state.
-    Returns: (start_epoch, global_step, best_dev)
-    """
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
-    
-    logger.info(f"Loading checkpoint from {checkpoint_dir}")
-    
-    # Load model states
-    qformer_state = torch.load(checkpoint_dir / "qformer.pt", map_location=device)
-    projector_state = torch.load(checkpoint_dir / "projector.pt", map_location=device)
-    align_state = torch.load(checkpoint_dir / "align_heads.pt", map_location=device)
-    
-    unwrap_model(qformer).load_state_dict(qformer_state)
-    unwrap_model(projector).load_state_dict(projector_state)
-    unwrap_model(align).load_state_dict(align_state)
-    
-    # Load optimizer state
-    optimizer_state = torch.load(checkpoint_dir / "optimizer.pt", map_location=device)
-    optimizer.load_state_dict(optimizer_state)
-    
-    # Load scheduler state if it exists
-    scheduler_path = checkpoint_dir / "scheduler.pt"
-    if scheduler is not None and scheduler_path.exists():
-        scheduler_state = torch.load(scheduler_path, map_location=device)
-        scheduler.load_state_dict(scheduler_state)
-    
-    # Load training progress metadata
-    metadata = torch.load(checkpoint_dir / "metadata.pt", map_location=device)
-    epoch = metadata["epoch"]
-    global_step = metadata["global_step"]
-    best_dev = metadata["best_dev"]
-    
-    # Restore random states
-    try:
-        torch.set_rng_state(metadata["torch_rng_state"].cpu())
-    except Exception as e:
-        logger.warning(f"Could not restore torch RNG state: {e}")
-    
-    if metadata["cuda_rng_state"] is not None and torch.cuda.is_available():
-        try:
-            # Ensure cuda_rng_state is a list of ByteTensors
-            cuda_states = metadata["cuda_rng_state"]
-            if isinstance(cuda_states, list):
-                # Convert each state to ByteTensor if needed
-                cuda_states = [s.to(torch.uint8) if not s.dtype == torch.uint8 else s for s in cuda_states]
-                torch.cuda.set_rng_state_all(cuda_states)
-            else:
-                logger.warning(f"CUDA RNG state has unexpected type: {type(cuda_states)}")
-        except Exception as e:
-            logger.warning(f"Could not restore CUDA RNG state: {e}")
-    
-    if metadata["numpy_rng_state"] is not None and PYDUB_AVAILABLE:
-        try:
-            np.random.set_state(metadata["numpy_rng_state"])
-        except Exception as e:
-            logger.warning(f"Could not restore numpy RNG state: {e}")
-    
-    try:
-        random.setstate(metadata["python_rng_state"])
-    except Exception as e:
-        logger.warning(f"Could not restore Python RNG state: {e}")
-    
-    logger.info(f"Resumed from checkpoint: epoch={epoch}, step={global_step}, best_dev={best_dev:.4f}")
-    
-    return epoch, global_step, best_dev
-
-
+# Evaluation logic
 def _build_eval_batch(
     tokenizer,
     emb_layer,
@@ -536,29 +543,42 @@ def _build_eval_batch(
     tgt_attn_mask: Optional[torch.Tensor],
     emb_device: torch.device,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, List[int]]:
+    """
+    A helper function to construct the final `inputs_embeds` tensor for the LLM.
+
+    This is a complex but necessary step because the input to the LLM is a mix of
+    text and audio information that is already in the embedding space. It concatenates
+    the embeddings for: [Instruction Text] -> [<AUD> Separator] -> [Audio Embeds]
+    -> [Target Text (optional)], and handles the required padding and attention masks.
+    """
     B = audio_embeds.size(0)
     per_sample_inputs: List[torch.Tensor] = []
     per_sample_labels: List[torch.Tensor] = []
     per_sample_lengths: List[int] = []
 
+    # Process each sample in the batch individually before padding.
     for i in range(B):
+        # Embed the instruction prompt.
         prompt_ids = tokenizer(instructions[i], return_tensors="pt").input_ids.to(emb_device)
         prompt_emb = emb_layer(prompt_ids)
         sep_emb = sep_emb_static
         a_emb = audio_embeds[i : i + 1]
 
         if tgt_ids_batch is not None and tgt_attn_mask is not None:
+            # For loss calculation: include target text embeddings (teacher forcing).
             tgt_len = int(tgt_attn_mask[i].sum().item())
             tgt_ids = tgt_ids_batch[i : i + 1, :tgt_len]
             tgt_emb = emb_layer(tgt_ids)
             inputs_embeds = torch.cat([prompt_emb, sep_emb, a_emb, tgt_emb], dim=1)
         else:
+            # For generation: only include the prefix.
             inputs_embeds = torch.cat([prompt_emb, sep_emb, a_emb], dim=1)
 
         per_sample_inputs.append(inputs_embeds)
         per_sample_lengths.append(int(inputs_embeds.size(1)))
 
         if tgt_ids_batch is not None and tgt_attn_mask is not None:
+            # Create labels for loss calculation, ignoring the prefix part.
             prefix_len = prompt_emb.size(1) + sep_emb.size(1) + a_emb.size(1)
             labels = torch.full(
                 (1, inputs_embeds.size(1)), fill_value=-100, dtype=torch.long, device=emb_device
@@ -566,6 +586,7 @@ def _build_eval_batch(
             labels[:, prefix_len:] = tgt_ids
             per_sample_labels.append(labels)
 
+    # Pad all samples in the batch to the same maximum length.
     max_len = max(per_sample_lengths) if per_sample_lengths else 0
     padded_inputs: List[torch.Tensor] = []
     padded_labels: List[torch.Tensor] = []
@@ -625,6 +646,13 @@ def evaluate_dataset(
     save_predictions_path: Optional[Path] = None,
     num_preview: int = 3,
 ) -> Tuple[float, List[Dict[str, str]]]:
+    """
+    Runs the full evaluation loop on a given dataset split (e.g., 'dev').
+
+    It calculates the language modeling loss on the ground-truth summaries and
+    also generates new summaries from scratch to see what the model produces.
+    Results and previews are logged and can be saved to a file.
+    """
     ds = JsonlSummDataset(Path(dataset_jsonl))
     def collate_fn(samples: List[Sample]) -> List[Sample]:
         # Return raw samples - feature extraction will be done in eval loop on GPU
@@ -651,27 +679,30 @@ def evaluate_dataset(
         save_predictions_path.parent.mkdir(parents=True, exist_ok=True)
         save_predictions_path.write_text("")
 
+    # Set models to evaluation mode.
     llama_was_training = any(p.requires_grad and p.grad is not None for p in llama.parameters()) or llama.training
     llama.eval()
 
-    global_offset = 0
-    for batch in tqdm(loader, desc=f"Evaluating {split_name}"):
-        # Do feature extraction on main process with GPU
-        seqs, padding_mask, targets, insts, audio_paths = collate_to_fbank(translator, batch)
-        
+    # It iterates through the evaluation data loader.
+    for seqs, padding_mask, targets, insts, audio_paths in tqdm(loader, desc=f"Evaluating {split_name}"):
         seqs = seqs.to(device=device, dtype=dtype)
         if padding_mask is not None and hasattr(padding_mask, "to"):
             padding_mask = padding_mask.to(device)
 
+        # Forward pass through the audio pipeline.
+        # For each batch, it performs a forward pass to get the audio embeddings from the Q-Former.
         enc_out, enc_pad = translator.model.encode_speech(seqs, padding_mask)
         enc_out = enc_out.to(dtype=train_dtype)
         audio_tokens = qformer(enc_out, None)
         audio_embeds = projector(audio_tokens).to(device=emb_layer.weight.device, dtype=emb_layer.weight.dtype)
 
+        # Prepare target text tokens.
         tgt_tok = tokenizer(targets, return_tensors="pt", padding=True, truncation=True)
         tgt_ids_batch = tgt_tok.input_ids.to(emb_layer.weight.device)
         tgt_attn_mask = tgt_tok.attention_mask.to(emb_layer.weight.device)
 
+        # 1. Calculate validation loss.
+        # It calculates the language modeling loss on the ground-truth summaries (to measure how well the model predicts the correct text).
         inputs_embeds, labels, attention_mask, _ = _build_eval_batch(
             tokenizer,
             emb_layer,
@@ -690,19 +721,40 @@ def evaluate_dataset(
         total_loss += float(lm_loss) * bs
         total_count += bs
 
-        # Run generation only for sampled dataset indices
-        local_selected = [i for i in range(bs) if (global_offset + i) in selected_indices]
-        if local_selected:
-            gen_inputs, _, gen_attn, _ = _build_eval_batch(
-                tokenizer,
-                emb_layer,
-                sep_emb_static,
-                audio_embeds,
-                insts,
-                None,
-                None,
-                emb_layer.weight.device,
-            )
+        # 2. Generate predictions.
+        # It also generates new summaries from scratch using llama.generate to see what the model produces on its own.
+        gen_inputs, _, gen_attn, lengths = _build_eval_batch(
+            tokenizer,
+            emb_layer,
+            sep_emb_static,
+            audio_embeds,
+            insts,
+            None, # No target text for generation.
+            None,
+            emb_layer.weight.device,
+        )
+        gen_out = llama.generate(
+            inputs_embeds=gen_inputs,
+            attention_mask=gen_attn,
+            max_new_tokens=gen_max_new_tokens,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            use_cache=True,
+        )
+        # Decode only the newly generated tokens.
+        gen_tokens_only = gen_out[:, gen_inputs.size(1):]
+        preds = tokenizer.batch_decode(gen_tokens_only, skip_special_tokens=True)
+
+        # Collect previews and save predictions.
+        for i in range(min(num_preview - len(previews), bs)):
+            previews.append({
+                "audio": audio_paths[i],
+                "pred": preds[i].strip(),
+                "ref": targets[i],
+            })
+            if len(previews) >= num_preview:
+                break
 
             index_tensor = torch.tensor(local_selected, device=gen_inputs.device, dtype=torch.long)
             gen_inputs_sel = gen_inputs.index_select(0, index_tensor)
@@ -746,27 +798,23 @@ def evaluate_dataset(
     avg_loss = total_loss / max(1, total_count)
     logger.info(f"{split_name} avg_lm_loss={avg_loss:.4f}")
 
+    # Restore LLM to its original training state.
     if llama_was_training:
         llama.train()
 
+    # It returns the average loss and a list of prediction previews.
     return avg_loss, previews
 
 
 def train(args: argparse.Namespace) -> None:
-    # Initialize distributed training
-    rank, world_size, local_rank = setup_distributed()
+    """
+    The main function that orchestrates the entire training process.
+    """
+    # --- 1. SETUP ---
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s -- %(name)s: %(message)s")
 
-    # Only main process should log at INFO level
-    log_level = logging.INFO if is_main_process() else logging.WARNING
-    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s -- %(name)s: %(message)s")
-
-    # Use local_rank to set device for distributed training
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-
+    # Configure device and data types for training (e.g., CUDA, FP16).
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     use_fp16 = (args.use_fp16 or not args.no_fp16) and torch.cuda.is_available()
     dtype = torch.float16 if use_fp16 else torch.float32
     amp_enabled = dtype == torch.float16 and device.type == "cuda"
@@ -775,9 +823,8 @@ def train(args: argparse.Namespace) -> None:
         torch.cuda.empty_cache()
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-    if is_main_process():
-        logger.info(f"Training on {world_size} processes with device={device}, dtype={dtype}, amp_enabled={amp_enabled}")
-
+    # --- 2. LOAD PRE-TRAINED MODELS ---
+    # Load the SeamlessM4T model via its Translator interface. This will be frozen.
     translator = Translator(
         args.model_name,
         vocoder_name_or_card=None,
@@ -788,21 +835,24 @@ def train(args: argparse.Namespace) -> None:
     set_requires_grad(translator.model, False)
 
     model_dim = translator.model.model_dim
-    qcfg = AudioQFormerConfig(
-        model_dim=model_dim,
-        num_layers=args.qformer_layers,
-        num_heads=args.qformer_heads,
-        num_queries=args.qformer_queries,
-        mlp_ratio=4.0,
-        dropout=0.1,
-    )
+    # qcfg = AudioQFormerConfig(
+    #     model_dim=model_dim,
+    #     num_layers=args.qformer_layers,
+    #     num_heads=args.qformer_heads,
+    #     num_queries=args.qformer_queries,
+    #     mlp_ratio=4.0,
+    #     dropout=0.1,
+    # )
+
     train_dtype = torch.float32 if amp_enabled else dtype
     qformer = AudioQFormer(qcfg).to(device=device, dtype=train_dtype)
     projector: SimpleProjector
 
+    # Load the LLM (Llama-3-8B-Instruct) and its tokenizer from Hugging Face.
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     def _resolve_llm_repo_id(repo_id: str) -> str:
+        # Helper to map short names to full Hugging Face repo IDs.
         rid = repo_id.strip()
         lower = rid.lower()
         aliases = {
@@ -815,6 +865,7 @@ def train(args: argparse.Namespace) -> None:
 
     llm_repo_id = _resolve_llm_repo_id(args.llm_model_name)
 
+    # Handle Hugging Face authentication for gated models.
     hf_token = (
         args.hf_token
         or os.getenv("HF_TOKEN")
@@ -842,8 +893,10 @@ def train(args: argparse.Namespace) -> None:
         AutoModelForCausalLM.from_pretrained,
         llm_repo_id,
         torch_dtype=dtype,
-        device_map={"": device},  # Explicitly load to current device
+        device_map="auto", # Automatically handle multi-GPU setup.
     )
+
+    # Optionally load LoRA adapters to fine-tune the LLM. Otherwise, freeze it.
     if args.llm_lora is not None and args.llm_lora != "":
         from peft import PeftModel
 
@@ -852,43 +905,53 @@ def train(args: argparse.Namespace) -> None:
         set_requires_grad(llama, False)
         llama.eval()
 
+    # Enable gradient checkpointing to save memory during training.
     if args.gradient_checkpointing and hasattr(llama, 'gradient_checkpointing_enable'):
         llama.gradient_checkpointing_enable()
         print("Gradient checkpointing enabled for memory efficiency")
 
+    # --- 3. INITIALIZE TRAINABLE BRIDGE COMPONENTS ---
+    # Creates the instances of AudioQFormer, SimpleProjector, and AlignHeads which will be trained.
+    model_dim = translator.model.model_dim # Dimension of SeamlessM4T's encoder output.
+    qcfg = AudioQFormerConfig(
+        model_dim=model_dim,
+        num_layers=args.qformer_layers,
+        num_heads=args.qformer_heads,
+        num_queries=args.qformer_queries,
+        mlp_ratio=4.0,
+        dropout=0.1,
+    )
+    # Use float32 for trainable components during mixed-precision training for stability.
+    train_dtype = torch.float32 if amp_enabled else dtype
+    qformer = AudioQFormer(qcfg).to(device=device, dtype=train_dtype)
+
+    # Initialize the projector to map Q-Former output to LLM embedding dimension.
     emb_layer = llama.get_input_embeddings()
+    llm_emb_dim = emb_layer.embedding_dim
+    projector = SimpleProjector(in_dim=model_dim, out_dim=llm_emb_dim).to(device=device, dtype=train_dtype)
+
+    # Initialize the alignment heads and contrastive queues.
+    align = AlignHeads(d_q=model_dim, d_t=llm_emb_dim, d_con=getattr(args, "contrastive_dim", 768)).to(device=device, dtype=train_dtype)
+    text_queue = ContrastiveQueue(d_con=getattr(args, "contrastive_dim", 768), K=getattr(args, "queue_size", 32768), device=str(device))
+    audio_queue = ContrastiveQueue(d_con=getattr(args, "contrastive_dim", 768), K=getattr(args, "queue_size", 32768), device=str(device))
+
+    # Pre-embed the special <AUD> token separator.
     emb_device = emb_layer.weight.device
     llm_dtype = emb_layer.weight.dtype
     sep_ids = tokenizer("<AUD>", add_special_tokens=False, return_tensors="pt").input_ids.to(emb_device)
     with torch.no_grad():
         sep_emb_static = emb_layer(sep_ids)
 
-    llm_emb_dim = emb_layer.embedding_dim
-    projector = SimpleProjector(in_dim=model_dim, out_dim=llm_emb_dim).to(device=device, dtype=train_dtype)
+    # --- 4. SETUP OPTIMIZER, SCHEDULER, AND DATALOADER ---
+    # Configures the AdamW optimizer to only update the parameters of the trainable components, sets up a learning rate scheduler, and creates the training DataLoader.
 
-    align = AlignHeads(d_q=model_dim, d_t=llm_emb_dim, d_con=args.contrastive_dim).to(device=device, dtype=train_dtype)
-    text_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
-    audio_queue = ContrastiveQueue(d_con=args.contrastive_dim, K=args.queue_size, device=str(device))
-
-    # Wrap models with DDP for distributed training
-    if world_size > 1:
-        qformer = DDP(qformer, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        projector = DDP(projector, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        align = DDP(align, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        if is_main_process():
-            logger.info("Wrapped models with DistributedDataParallel")
-
-    # Create references to unwrapped models for accessing custom methods/attributes
-    # (DDP doesn't expose custom methods, only forward())
-    qformer_module = unwrap_model(qformer)
-    projector_module = unwrap_model(projector)
-    align_module = unwrap_model(align)
-
+    # Collect all parameters that require gradients for the optimizer.
     params = list(qformer.parameters()) + list(projector.parameters()) + list(align.parameters())
-    if any(p.requires_grad for p in llama.parameters()):
+    if any(p.requires_grad for p in llama.parameters()): # Add LoRA params if any.
         params += [p for p in llama.parameters() if p.requires_grad]
     optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
+    # Setup the data loader for the training set.
     ds = JsonlSummDataset(Path(args.dataset_jsonl))
     def collate_fn(samples: List[Sample]) -> List[Sample]:
         # Return raw samples - feature extraction will be done in main training loop on GPU
@@ -906,6 +969,7 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn
     )
 
+    # Setup a cosine learning rate scheduler with a warmup phase.
     try:
         from transformers import get_cosine_schedule_with_warmup
     except Exception:
@@ -922,31 +986,13 @@ def train(args: argparse.Namespace) -> None:
         else None
     )
 
+    # Initialize a gradient scaler for stable mixed-precision training.
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
+    # --- 5. THE MAIN TRAINING LOOP ---
+    # a nested loop over epochs and batches
     step = 0
-    best_dev = float("inf")
-    start_epoch = 0
-    
-    # Load checkpoint if resuming
-    if args.resume_from_checkpoint is not None:
-        checkpoint_path = Path(args.resume_from_checkpoint)
-        if checkpoint_path.exists():
-            start_epoch, step, best_dev = load_full_checkpoint(
-                checkpoint_dir=checkpoint_path,
-                qformer=qformer,
-                projector=projector,
-                align=align,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                device=device,
-            )
-            if is_main_process():
-                logger.info(f"Successfully resumed from checkpoint at epoch {start_epoch}, step {step}")
-        else:
-            if is_main_process():
-                logger.warning(f"Checkpoint path {checkpoint_path} does not exist. Starting from scratch.")
-    
+    # Set trainable modules to training mode.
     qformer.train()
     projector.train()
     align.train()
@@ -980,23 +1026,26 @@ def train(args: argparse.Namespace) -> None:
             seqs, padding_mask, targets, insts, _audio_paths = collate_to_fbank(translator, batch)
             
             step += 1
-            batches_in_epoch += 1
+            # Move data to the appropriate device.
             seqs = seqs.to(device=device, dtype=dtype)
             if padding_mask is not None and hasattr(padding_mask, "to"):
                 padding_mask = padding_mask.to(device)
+
+            # --- 5a. Forward pass through the audio encoder and Q-Former ---
             with torch.no_grad():
+                # Extract audio features from the frozen SeamlessM4T encoder.
                 enc_out, enc_pad = translator.model.encode_speech(seqs, padding_mask)
 
+            # Pass features through the trainable bridge components.
             enc_out = enc_out.to(dtype=train_dtype)
-            audio_tokens = qformer(enc_out, None)
-            audio_embeds = projector(audio_tokens)
+            audio_tokens = qformer(enc_out, None) # Q-Former output.
+            audio_embeds = projector(audio_tokens) # Projector output (for LLM).
 
-            per_sample_inputs: List[torch.Tensor] = []
-            per_sample_labels: List[torch.Tensor] = []
-            per_sample_lengths: List[int] = []
-
+            # --- 5b. Prepare features for alignment losses ---
+            # Pool the Q-Former output to get a single vector representation for the audio.
             q_pool = audio_tokens.mean(dim=1)
 
+            # Get a single vector representation for the corresponding text summary.
             with torch.no_grad():
                 tgt_tok = tokenizer(targets, return_tensors="pt", padding=True, truncation=True)
                 tgt_ids_batch = tgt_tok.input_ids.to(emb_device)
@@ -1005,7 +1054,10 @@ def train(args: argparse.Namespace) -> None:
                 mask = tgt_attn_mask.float().unsqueeze(-1)
                 t_pool = (t_input_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
-            qz, tz = align_module.forward_proj(q_pool, t_pool.to(device=device, dtype=train_dtype))
+            # Project audio and text pools into the shared space.
+            qz, tz = align.forward_proj(q_pool, t_pool.to(device=device, dtype=train_dtype))
+
+            # --- 5c. Calculate alignment losses ---
             L_con = contrastive_loss_bidir(
                 qz,
                 tz,
@@ -1014,6 +1066,13 @@ def train(args: argparse.Namespace) -> None:
                 logit_scale=align_module.logit_scale.clamp(0, 5).exp(),
             )
             L_match = matching_loss(align_module, qz, tz, queue_feats=text_queue.feats.to(qz.device), num_queue_negs=args.num_queue_negs)
+
+            # --- 5d. Construct input and calculate LLM loss ---
+            # This is done sample-by-sample and then padded, due to the complexity
+            # of concatenating embeddings of different lengths.
+            per_sample_inputs: List[torch.Tensor] = []
+            per_sample_labels: List[torch.Tensor] = []
+            per_sample_lengths: List[int] = []
 
             for i in range(len(targets)):
                 instruction = insts[i]
@@ -1028,14 +1087,18 @@ def train(args: argparse.Namespace) -> None:
                 tgt_ids = tgt_ids_batch[i : i + 1, :tgt_len]
                 tgt_emb = emb_layer(tgt_ids)
 
+                # Concatenate all parts to form the final input embeddings.
                 inputs_embeds = torch.cat([prompt_emb, sep_emb, a_emb, tgt_emb], dim=1)
                 per_sample_inputs.append(inputs_embeds)
                 per_sample_lengths.append(int(inputs_embeds.size(1)))
 
+                # Create labels for the LLM, ignoring all prefix tokens (instruction, audio).
                 prefix_len = prompt_emb.size(1) + sep_emb.size(1) + a_emb.size(1)
                 labels = torch.full((1, inputs_embeds.size(1)), fill_value=-100, dtype=torch.long, device=emb_device)
                 labels[:, prefix_len:] = tgt_ids
                 per_sample_labels.append(labels)
+            
+            # Pad the batch to the maximum length.
             max_len = max(per_sample_lengths) if per_sample_lengths else 0
             padded_inputs: List[torch.Tensor] = []
             padded_labels: List[torch.Tensor] = []
@@ -1063,34 +1126,47 @@ def train(args: argparse.Namespace) -> None:
             labels = torch.cat(padded_labels, dim=0)
             attention_mask = torch.cat(attention_masks, dim=0)
 
+            # Get the language modeling loss from the LLM.
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 out = llama(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
                 lm_loss = out.loss
 
+            # --- 5e. Combine losses and backpropagate ---
+            # Update contrastive queues with the latest features.
             with torch.no_grad():
                 audio_queue.enqueue(qz.detach().to(audio_queue.feats.device))
                 text_queue.enqueue(tz.detach().to(text_queue.feats.device))
 
+            # Combine all three loss components with their respective weights.
             total_loss = lm_loss + args.lambda_con * L_con + args.lambda_match * L_match
+            # Normalize loss for gradient accumulation.
             loss = total_loss / max(1, args.grad_accum_steps)
 
+            # Perform backward pass using the AMP scaler.
             scaler.scale(loss).backward()
 
+            # --- 5f. Optimizer step (with gradient accumulation) ---
             if step % args.grad_accum_steps == 0:
+                # Unscale gradients before clipping.
                 scaler.unscale_(optimizer)
+                # Clip gradients to prevent exploding gradients.
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                # Optimizer takes a step.
                 scaler.step(optimizer)
+                # Update the scaler for the next iteration.
                 scaler.update()
+                # Zero out gradients for the next accumulation cycle.
                 optimizer.zero_grad(set_to_none=True)
+                # Occasionally clear CUDA cache to free up memory.
                 if step % (args.grad_accum_steps * 10) == 0:
                     torch.cuda.empty_cache()
+                # Step the learning rate scheduler.
                 if scheduler is not None:
                     scheduler.step()
 
-            if step % args.log_every == 0 and is_main_process():
-                elapsed_time = time.time() - training_start_time
-                hours, remainder = divmod(int(elapsed_time), 3600)
-                minutes, seconds = divmod(remainder, 60)
+            # --- 5g. Logging and Evaluation ---
+            if step % args.log_every == 0:
+                # Log the current loss values to the console and progress bar.
                 loss_info = (
                     f"epoch={epoch} step={step} elapsed={hours:02d}:{minutes:02d}:{seconds:02d} "
                     f"loss={(float(loss) * args.grad_accum_steps):.4f} "
@@ -1105,8 +1181,8 @@ def train(args: argparse.Namespace) -> None:
                     'match': f"{float(L_match):.4f}"
                 })
 
-            # Step-based dev eval (only if > 0)
-            if (args.dev_eval_steps > 0 and step > 0 and step % args.dev_eval_steps == 0 and 
+            # Periodically run evaluation on the dev set.
+            if (step > 0 and step % args.dev_eval_steps == 0 and 
                 args.dev_jsonl is not None and os.path.isfile(args.dev_jsonl)):
                 eval_bs = args.eval_batch_size if args.eval_batch_size is not None else args.batch_size
                 dev_loss, previews = evaluate_dataset(
@@ -1338,6 +1414,9 @@ def train(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    """
+    It defines all possible command-line arguments (like learning rate, batch size, model names, number of Q-Former layers, etc.) using argparse, parses them from the user's command
+    """
     p = argparse.ArgumentParser(description="Train Q-Former + projector for audio->LLM summarization")
     p.add_argument("--dataset_jsonl", type=str, default=f"{DATA_DIR}/train.jsonl", help="Path to JSONL with {audio, summary, [tgt_lang], [instruction]}")
     p.add_argument("--model_name", type=str, default="seamlessM4T_v2_large", help="UnitY model name")
