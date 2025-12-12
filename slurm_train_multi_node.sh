@@ -59,6 +59,11 @@ echo "Master node: $MASTER_ADDR"
 echo "Master port: $MASTER_PORT"
 echo "World size: $WORLD_SIZE"
 
+# Start GPU monitoring in background (logs every 10 seconds)
+nvidia-smi --query-gpu=timestamp,name,pci.bus_id,driver_version,pstate,pcie.link.gen.max,pcie.link.gen.current,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used --format=csv -l 10 > logs/gpu_util_${SLURM_JOB_ID}.csv &
+GPU_MONITOR_PID=$!
+echo "GPU monitoring started (PID: $GPU_MONITOR_PID)"
+
 # ============================================
 # Training arguments - MODIFY THESE AS NEEDED
 # ============================================
@@ -153,4 +158,9 @@ srun python train_qformer_llm.py \
     --early_stop_patience 10 \
     $RESUME_FLAG
 
+# Stop GPU monitoring
+kill $GPU_MONITOR_PID 2>/dev/null
+echo "GPU monitoring stopped"
+
 echo "Training completed!"
+echo "GPU utilization log saved to: logs/gpu_util_${SLURM_JOB_ID}.csv"
