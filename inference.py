@@ -10,7 +10,7 @@ from seamless_communication.inference.translator import Translator
 import os
 import pathlib
 import torch.nn as nn
-import torch``
+import torch
 from transformers import AutoProcessor, AutoModelForVision2Seq, AutoTokenizer, AutoModelForCausalLM
 
 # --- Model and Data-related classes and functions from the project ---
